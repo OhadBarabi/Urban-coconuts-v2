@@ -17,7 +17,8 @@ import { getAvailableRentalItems } from './rentals/getAvailableRentalItems';
 import { createRentalBooking } from './rentals/createRentalBooking';
 import { confirmRentalPickup } from './rentals/confirmRentalPickup';
 import { confirmRentalReturn } from './rentals/confirmRentalReturn';
-import { handleRentalDeposit } from './rentals/handleRentalDeposit'; // <-- שורה חדשה (רק import, לא export)
+// Import background/triggered functions so they are included in the deployment
+import { handleRentalDeposit } from './rentals/handleRentalDeposit';
 // ... import other functions as they are added ...
 
 // Export HTTPS Callable functions for deployment
@@ -33,8 +34,7 @@ export {
   // ... export other callable functions ...
 };
 
-// Ensure background functions are loaded for deployment by importing them
-// This line ensures the handleRentalDeposit function code is included in the deployment bundle.
-// Even though it's not exported for direct calling, Firebase needs to know about it.
-// If you have more background functions, import them here as well.
-handleRentalDeposit; // This reference ensures the import is not removed by tree-shaking
+// Ensure background functions are loaded for deployment by referencing them.
+// This ensures the imported code (like handleRentalDeposit) is not removed by tree-shaking.
+// Add references for other background/triggered functions here as well.
+handleRentalDeposit;
