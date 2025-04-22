@@ -25,7 +25,8 @@ import { getAvailableReturnBoxes } from './rentals/getAvailableReturnBoxes';
 
 // --- Import Events Functions ---
 import { getEventMenus } from './events/getEventMenus';
-import { checkEventAvailability } from './events/checkEventAvailability'; // <-- שורה חדשה
+import { checkEventAvailability } from './events/checkEventAvailability';
+import { createEventBooking } from './events/createEventBooking'; // <-- שורה חדשה
 // ... import other event functions ...
 
 // ... import other modules ...
@@ -44,7 +45,8 @@ export {
   getAvailableReturnBoxes,
   // Events
   getEventMenus,
-  checkEventAvailability, // <-- שורה חדשה
+  checkEventAvailability,
+  createEventBooking, // <-- שורה חדשה
   // ... export other callable functions ...
 };
 
