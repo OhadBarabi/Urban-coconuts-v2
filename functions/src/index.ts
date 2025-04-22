@@ -39,7 +39,10 @@ import { createRole, updateRole, deleteRole, listRoles } from './rbac/manageRole
 import { listPermissions, assignRoleToUser } from './rbac/managePermissionsUsers';
 
 // --- Import Admin Functions ---
-import { setUserActiveStatus, adjustBoxInventory } from './admin/manageUsersInventory'; // <-- שורה חדשה
+import { setUserActiveStatus, adjustBoxInventory } from './admin/manageUsersInventory';
+
+// --- Import Scheduled Functions ---
+import { autoCancelExpiredOrders, deactivateExpiredPromotions, cleanupOldLogs } from './scheduled/scheduledFunctions'; // <-- שורה חדשה (רק import)
 
 // ... import other modules ...
 
@@ -72,12 +75,15 @@ export {
   listPermissions,
   assignRoleToUser,
   // Admin
-  setUserActiveStatus, // <-- שורה חדשה
-  adjustBoxInventory, // <-- שורה חדשה
+  setUserActiveStatus,
+  adjustBoxInventory,
   // ... export other callable functions ...
 };
 
-// Ensure background/triggered functions are loaded for deployment by referencing them.
+// Ensure background/triggered/scheduled functions are loaded for deployment by referencing them.
 handleRentalDeposit;
 createGoogleCalendarEvent;
+autoCancelExpiredOrders; // <-- שורה חדשה
+deactivateExpiredPromotions; // <-- שורה חדשה
+cleanupOldLogs; // <-- שורה חדשה
 // ... add references for other background/triggered functions ...
