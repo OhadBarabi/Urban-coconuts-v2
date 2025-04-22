@@ -15,7 +15,8 @@ import { createOrder } from './core/createOrder';
 import { updateOrderStatus } from './core/updateOrderStatus';
 import { getAvailableRentalItems } from './rentals/getAvailableRentalItems';
 import { createRentalBooking } from './rentals/createRentalBooking';
-import { confirmRentalPickup } from './rentals/confirmRentalPickup'; // <-- שורה חדשה
+import { confirmRentalPickup } from './rentals/confirmRentalPickup';
+import { confirmRentalReturn } from './rentals/confirmRentalReturn'; // <-- שורה חדשה
 // ... import other functions as they are added ...
 
 // Export functions for deployment
@@ -24,6 +25,7 @@ export {
   updateOrderStatus,
   getAvailableRentalItems,
   createRentalBooking,
-  confirmRentalPickup, // <-- שורה חדשה
+  confirmRentalPickup,
+  confirmRentalReturn, // <-- שורה חדשה
   // ... export other functions ...
 };
