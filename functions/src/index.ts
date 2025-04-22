@@ -36,8 +36,10 @@ import { cancelEventBooking as cancelEventBookingEvent } from './events/cancelEv
 
 // --- Import RBAC Functions ---
 import { createRole, updateRole, deleteRole, listRoles } from './rbac/manageRoles';
-import { listPermissions, assignRoleToUser } from './rbac/managePermissionsUsers'; // <-- שורה חדשה
-// ... import other rbac functions ...
+import { listPermissions, assignRoleToUser } from './rbac/managePermissionsUsers';
+
+// --- Import Admin Functions ---
+import { setUserActiveStatus, adjustBoxInventory } from './admin/manageUsersInventory'; // <-- שורה חדשה
 
 // ... import other modules ...
 
@@ -67,8 +69,11 @@ export {
   updateRole,
   deleteRole,
   listRoles,
-  listPermissions, // <-- שורה חדשה
-  assignRoleToUser, // <-- שורה חדשה
+  listPermissions,
+  assignRoleToUser,
+  // Admin
+  setUserActiveStatus, // <-- שורה חדשה
+  adjustBoxInventory, // <-- שורה חדשה
   // ... export other callable functions ...
 };
 
