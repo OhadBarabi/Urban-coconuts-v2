@@ -1,0 +1,994 @@
+openapi: 3.0.3
+info:
+  title: Urban Coconuts V2 API
+  description: |-
+    API specification for Urban Coconuts V2 Firebase Cloud Functions (HTTPS Callable).
+    Covers core ordering, rentals, events, admin, and utility functions based on V5 design.
+  version: 2.0.0
+servers:
+  - url: 'https://{region}-{projectId}.cloudfunctions.net'
+    variables:
+      region:
+        default: me-west1 # Or your chosen region
+        description: Firebase Functions region
+      projectId:
+        default: urban-coconuts-v2 # Your Firebase project ID
+        description: Firebase project ID
+
+# Define reusable components (schemas, security schemes)
+components:
+  schemas:
+    # --- Common Error Response ---
+    ErrorResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: false
+        error:
+          type: string
+          description: i18n key for the error message.
+          example: "error.auth.unauthenticated"
+        errorCode:
+          type: string
+          description: Machine-readable error code.
+          example: "UNAUTHENTICATED"
+      required:
+        - success
+        - error
+        - errorCode
+
+    # --- Common Success Response (Simple) ---
+    SuccessResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+      required:
+        - success
+
+    # --- Location Input/Output ---
+    LocationInput:
+      type: object
+      properties:
+        latitude:
+          type: number
+          format: double
+        longitude:
+          type: number
+          format: double
+      required:
+        - latitude
+        - longitude
+    LocationOutput: # Same as input for this spec
+      type: object
+      properties:
+        latitude:
+          type: number
+          format: double
+        longitude:
+          type: number
+          format: double
+      required:
+        - latitude
+        - longitude
+    AddressInput:
+       type: object
+       properties:
+         address:
+           type: string
+           nullable: true
+         coordinates:
+           $ref: '#/components/schemas/LocationInput'
+           nullable: true
+         zoneId:
+           type: string
+           nullable: true
+         notes:
+           type: string
+           nullable: true
+
+    # --- i18n Map ---
+    I18nMap:
+      type: object
+      additionalProperties:
+        type: string
+      example:
+        en: "English Name"
+        he: "שם בעברית"
+
+    # --- NearbyBoxInfo (Output of getNearbyBoxes V5) ---
+    NearbyBoxInfoV5:
+      type: object
+      properties:
+        boxId:
+          type: string
+        boxNumber:
+          type: string
+        boxName_i18n:
+          $ref: '#/components/schemas/I18nMap'
+          nullable: true
+        location:
+          $ref: '#/components/schemas/LocationOutput'
+        address:
+          type: string
+          nullable: true
+        colorCode:
+          type: string
+          nullable: true
+        currencyCode:
+          type: string
+        distanceKm:
+          type: number
+          format: double
+        isOpen:
+          type: boolean
+          example: true
+        priority:
+          type: number
+        assignedMenuIds:
+          type: array
+          items:
+            type: string
+        pickupTimeBufferMinutes:
+          type: integer
+      required:
+        - boxId
+        - boxNumber
+        - location
+        - currencyCode
+        - distanceKm
+        - isOpen
+        - priority
+        - assignedMenuIds
+        - pickupTimeBufferMinutes
+
+    # --- Formatted Product (Output of getBoxMenus V3) ---
+    FormattedProductV5:
+      type: object
+      properties:
+        productId:
+          type: string
+        productName:
+          type: string
+          description: Translated name.
+        description:
+          type: string
+          nullable: true
+          description: Translated description.
+        imageUrl:
+          type: string
+          nullable: true
+          format: url
+        priceSmallestUnit:
+          type: integer
+        tags:
+          type: array
+          items:
+            type: string
+          nullable: true
+          example: ["Discount_10", "Vegan"]
+        priority:
+          type: number
+        category:
+          type: string
+          nullable: true
+      required:
+        - productId
+        - productName
+        - priceSmallestUnit
+        - priority
+
+    # --- Formatted Menu (Output of getBoxMenus V3) ---
+    FormattedMenuV5:
+      type: object
+      properties:
+        menuId:
+          type: string
+        menuName:
+          type: string
+          description: Translated name.
+        priority:
+          type: number
+        products:
+          type: array
+          items:
+            $ref: '#/components/schemas/FormattedProductV5'
+      required:
+        - menuId
+        - menuName
+        - priority
+        - products
+
+    # --- Selected Event Item (Input/Output for Event Bookings) ---
+    SelectedEventItem:
+      type: object
+      properties:
+        bookingItemId: # Only in output/update
+          type: string
+        itemId:
+          type: string
+        itemType:
+          type: string
+          enum: [Product, Package, Service, Rental]
+        productName: # Only in output/update
+          type: string
+        quantity:
+          type: integer
+          nullable: true
+        durationHours:
+          type: number
+          format: double
+          nullable: true
+        calculatedPriceSmallestUnit: # Only in output/update
+          type: integer
+        appliedUnitPriceSmallestUnit: # Only in output/update
+          type: integer
+          nullable: true
+        productId: # Only in output/update
+          type: string
+          nullable: true
+      required:
+        - itemId
+        - itemType
+        # quantity OR durationHours required based on type (validation in function)
+
+    # --- Event Assignments (Input for assignEventResources) ---
+    EventAssignmentsInput:
+      type: object
+      additionalProperties:
+        type: array
+        items:
+          type: string
+      example:
+        Team: ["teamAlphaId"]
+        Vehicle: ["van01Id"]
+
+  # --- Security Scheme (Firebase Auth ID Token) ---
+  securitySchemes:
+    firebaseAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Firebase Authentication ID token passed in the Authorization header.
+
+# Define security requirement (applies globally or per path)
+security:
+  - firebaseAuth: []
+
+# Define API paths (HTTPS Callable Functions)
+paths:
+  # --- Customer App Flow ---
+  /getNearbyBoxes:
+    post:
+      summary: Get nearby open and staffed boxes (V5)
+      operationId: getNearbyBoxesV5
+      tags: [Customer]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                data:
+                  type: object
+                  properties:
+                    location:
+                      $ref: '#/components/schemas/LocationInput'
+                    radiusKm:
+                      type: number
+                      format: double
+                      nullable: true
+                  required:
+                    - location
+      responses:
+        '200':
+          description: Success - Returns sorted list of nearby boxes.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result:
+                    type: object
+                    properties:
+                      success:
+                        type: boolean
+                        example: true
+                      nearbyBoxes:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/NearbyBoxInfoV5'
+                    required:
+                      - success
+                      - nearbyBoxes
+        default: # Error response
+          description: Error response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /getBoxMenus:
+    post:
+      summary: Get menus and products for a specific box (V3)
+      operationId: getBoxMenusV3
+      tags: [Customer]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                data:
+                  type: object
+                  properties:
+                    boxId:
+                      type: string
+                  required:
+                    - boxId
+      responses:
+        '200':
+          description: Success - Returns sorted menus and products for the box.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result:
+                    type: object
+                    properties:
+                      success:
+                        type: boolean
+                        example: true
+                      boxMenus:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/FormattedMenuV5'
+                    required:
+                      - success
+                      - boxMenus
+        default:
+          description: Error response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  # --- Core Order ---
+  /createOrder:
+    post:
+      summary: Create a new customer order
+      operationId: createOrder
+      tags: [Customer]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                data:
+                  type: object
+                  properties:
+                    cartData:
+                      type: object
+                      properties:
+                        boxId:
+                          type: string
+                        items:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              productId:
+                                type: string
+                              quantity:
+                                type: integer
+                            required:
+                              - productId
+                              - quantity
+                        notes:
+                          type: string
+                          nullable: true
+                      required:
+                        - boxId
+                        - items
+                    paymentMethod:
+                      type: string
+                      enum: [CreditCardApp, BitApp, UC_Coins_Only, CashOnDelivery, CreditOnDelivery]
+                    couponCode:
+                      type: string
+                      nullable: true
+                    ucCoinsToUse:
+                      type: integer
+                      nullable: true
+                  required:
+                    - cartData
+                    - paymentMethod
+      responses:
+        '200':
+          description: Success - Order created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result:
+                    type: object
+                    properties:
+                      success:
+                        type: boolean
+                        example: true
+                      orderId:
+                        type: string
+                    required:
+                      - success
+                      - orderId
+        default:
+          description: Error response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /updateOrderStatus:
+    post:
+      summary: Update order status (Courier/System)
+      operationId: updateOrderStatus
+      tags: [Courier, System]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                data:
+                  type: object
+                  properties:
+                    orderId:
+                      type: string
+                    newStatus:
+                      type: string
+                      enum: [Red, Yellow, Green, Black, Cancelled]
+                    details:
+                      type: object
+                      nullable: true
+                      properties:
+                        reason:
+                          type: string
+                        paymentTxId: # Example detail
+                          type: string
+                  required:
+                    - orderId
+                    - newStatus
+      responses:
+        '200':
+          description: Success - Status updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result:
+                    $ref: '#/components/schemas/SuccessResponse'
+        default:
+          description: Error response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  # --- Rentals ---
+  /getAvailableRentalItems:
+    post:
+      summary: Get available rental items nearby
+      operationId: getAvailableRentalItems
+      tags: [Customer, Rental]
+      # ... Define requestBody and responses similar to getNearbyBoxes ...
+      responses:
+        '200':
+          description: Success - Returns list of available rental items and pickup boxes.
+        default:
+          description: Error response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /createRentalBooking:
+    post:
+      summary: Create a new rental booking
+      operationId: createRentalBooking
+      tags: [Customer, Rental]
+      # ... Define requestBody (rentalItemId, pickupBoxId, timeWindow?) and responses ...
+      responses:
+        '200':
+          description: Success - Rental booking created, deposit authorized.
+        default:
+          description: Error response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  # ... Add paths for other rental functions (confirmRentalPickup, confirmRentalReturn, cancelRentalBooking, getAvailableReturnBoxes) ...
+
+  # --- Events ---
+  /getEventMenus:
+    post:
+      summary: Get available event menus
+      operationId: getEventMenus
+      tags: [Customer, Event]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                data:
+                  type: object # Optional filters here
+      responses:
+        '200':
+          description: Success - Returns list of event menus.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result:
+                    type: object
+                    properties:
+                      success:
+                        type: boolean
+                        example: true
+                      eventMenus:
+                        type: array
+                        items:
+                          type: object # Define FormattedEventMenuSummary schema
+                          properties:
+                            menuId:
+                              type: string
+                            menuName:
+                              type: string
+                            description:
+                              type: string
+                              nullable: true
+                            imageUrl:
+                              type: string
+                              nullable: true
+                    required:
+                      - success
+                      - eventMenus
+        default:
+          description: Error response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /checkEventAvailability:
+    post:
+      summary: Check availability for an event slot
+      operationId: checkEventAvailability
+      tags: [Customer, Event]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                data:
+                  type: object
+                  properties:
+                    startTime:
+                      type: string
+                      format: date-time
+                    endTime:
+                      type: string
+                      format: date-time
+                    location:
+                      $ref: '#/components/schemas/AddressInput'
+                    requiredResourceTypes:
+                      type: array
+                      items:
+                        type: string
+                  required:
+                    - startTime
+                    - endTime
+                    - location
+                    - requiredResourceTypes
+      responses:
+        '200':
+          description: Success - Returns availability status.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result:
+                    type: object
+                    properties:
+                      success:
+                        type: boolean
+                        example: true
+                      isAvailable:
+                        type: boolean
+                      reason:
+                        type: string
+                        nullable: true
+                    required:
+                      - success
+                      - isAvailable
+        default:
+          description: Error response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /createEventBooking:
+    post:
+      summary: Create an initial event booking request
+      operationId: createEventBooking
+      tags: [Customer, Event]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                data:
+                  type: object
+                  properties:
+                    eventDate:
+                      type: string
+                      format: date # Or date-time
+                    startTime:
+                      type: string
+                      format: date-time
+                    endTime:
+                      type: string
+                      format: date-time
+                    location:
+                      $ref: '#/components/schemas/AddressInput'
+                    eventMenuId:
+                      type: string
+                      nullable: true
+                    selectedItems:
+                      type: array
+                      items:
+                        $ref: '#/components/schemas/SelectedEventItem' # Input version
+                    notes:
+                      type: string
+                      nullable: true
+                  required:
+                    - startTime
+                    - endTime
+                    - location
+                    - selectedItems
+      responses:
+        '200':
+          description: Success - Event booking request created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result:
+                    type: object
+                    properties:
+                      success:
+                        type: boolean
+                        example: true
+                      bookingId:
+                        type: string
+                    required:
+                      - success
+                      - bookingId
+        default:
+          description: Error response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /approveEventBooking:
+      post:
+        summary: Approve or reject an event booking (Admin)
+        operationId: approveEventBooking
+        tags: [Admin, Event]
+        requestBody:
+          required: true
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      bookingId:
+                        type: string
+                      approvalStatus:
+                        type: string
+                        enum: [Approved, Rejected, ApprovedWithChanges]
+                      adminNotes:
+                        type: string
+                        nullable: true
+                      updatedItems:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/SelectedEventItem' # Output/Update version
+                        nullable: true
+                      updatedTotalAmountSmallestUnit:
+                        type: integer
+                        nullable: true
+                    required:
+                      - bookingId
+                      - approvalStatus
+        responses:
+          '200':
+            description: Success - Booking approved or rejected.
+            content:
+              application/json:
+                schema:
+                  type: object
+                  properties:
+                    result:
+                      $ref: '#/components/schemas/SuccessResponse'
+          default:
+            description: Error response.
+            content:
+              application/json:
+                schema:
+                  $ref: '#/components/schemas/ErrorResponse'
+
+  /confirmEventAgreement:
+      post:
+        summary: Confirm event agreement and trigger payment (Customer)
+        operationId: confirmEventAgreement
+        tags: [Customer, Event]
+        requestBody:
+          required: true
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      bookingId:
+                        type: string
+                      paymentMethodToken: # Optional for client-side token
+                        type: string
+                        nullable: true
+                    required:
+                      - bookingId
+        responses:
+          '200':
+            description: Success - Agreement confirmed, payment processed.
+            content:
+              application/json:
+                schema:
+                  type: object
+                  properties:
+                    result:
+                      $ref: '#/components/schemas/SuccessResponse'
+          default:
+            description: Error response.
+            content:
+              application/json:
+                schema:
+                  $ref: '#/components/schemas/ErrorResponse'
+
+  /assignEventResources:
+      post:
+        summary: Assign resources to an event (Admin)
+        operationId: assignEventResources
+        tags: [Admin, Event]
+        requestBody:
+          required: true
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      bookingId:
+                        type: string
+                      assignments:
+                        $ref: '#/components/schemas/EventAssignmentsInput'
+                    required:
+                      - bookingId
+                      - assignments
+        responses:
+          '200':
+            description: Success - Resources assigned.
+            content:
+              application/json:
+                schema:
+                  type: object
+                  properties:
+                    result:
+                      $ref: '#/components/schemas/SuccessResponse'
+          default:
+            description: Error response.
+            content:
+              application/json:
+                schema:
+                  $ref: '#/components/schemas/ErrorResponse'
+
+  /updateEventStatus:
+      post:
+        summary: Update the status of an event (Admin/Courier)
+        operationId: updateEventStatus
+        tags: [Admin, Courier, Event]
+        requestBody:
+          required: true
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      bookingId:
+                        type: string
+                      newStatus:
+                        type: string
+                        enum: [Preparing, InProgress, Completed, Delayed, RequiresAdminAttention]
+                      details:
+                        type: object
+                        nullable: true
+                        properties:
+                          actualStartTime:
+                            type: string
+                            format: date-time
+                            nullable: true
+                          actualEndTime:
+                            type: string
+                            format: date-time
+                            nullable: true
+                          reason:
+                            type: string
+                            nullable: true
+                    required:
+                      - bookingId
+                      - newStatus
+        responses:
+          '200':
+            description: Success - Event status updated.
+            content:
+              application/json:
+                schema:
+                  type: object
+                  properties:
+                    result:
+                      $ref: '#/components/schemas/SuccessResponse'
+          default:
+            description: Error response.
+            content:
+              application/json:
+                schema:
+                  $ref: '#/components/schemas/ErrorResponse'
+
+  /cancelEventBooking:
+      post:
+        summary: Cancel an event booking (Customer/Admin)
+        operationId: cancelEventBooking
+        tags: [Customer, Admin, Event]
+        requestBody:
+          required: true
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      bookingId:
+                        type: string
+                      reason:
+                        type: string
+                    required:
+                      - bookingId
+                      - reason
+        responses:
+          '200':
+            description: Success - Event booking cancelled.
+            content:
+              application/json:
+                schema:
+                  type: object
+                  properties:
+                    result:
+                      $ref: '#/components/schemas/SuccessResponse'
+          default:
+            description: Error response.
+            content:
+              application/json:
+                schema:
+                  $ref: '#/components/schemas/ErrorResponse'
+
+  # --- Admin RBAC ---
+  /assignRole:
+    post:
+      summary: Assign a role to a user (Admin)
+      operationId: assignRole
+      tags: [Admin, RBAC]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                data:
+                  type: object
+                  properties:
+                    userId:
+                      type: string
+                    roleId:
+                      type: string
+                  required:
+                    - userId
+                    - roleId
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+
+  # ... Add paths for other RBAC functions (removeRole, listRoles, listPermissions, getPermissionsForRole) ...
+
+  # --- Admin Utils ---
+  /manageBoxStatus:
+    post:
+      summary: Activate/deactivate a box (Admin)
+      operationId: manageBoxStatus
+      tags: [Admin]
+      # ... Define requestBody (boxId, isActive) and responses ...
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+
+  # ... Add paths for other Admin functions (manageCourierAssignment, manageProductInventory, managePromoCodes, viewLogs, viewUserFeedback, forceEndShift, manageUserProfile) ...
+
+  # --- Auth/MFA ---
+  /sendOtp:
+    post:
+      summary: Send OTP for phone verification/login
+      operationId: sendOtp
+      tags: [Auth]
+      # ... Define requestBody (phoneNumber) and responses ...
+      responses:
+        '200': { $ref: '#/components/responses/Success' }
+        default: { $ref: '#/components/responses/Error' }
+
+  # ... Add paths for other Auth/MFA functions (verifyOtp, enableMfa, disableMfa, verifyMfaChallenge) ...
+
+# Reusable responses
+responses:
+  Success:
+    description: Standard success response.
+    content:
+      application/json:
+        schema:
+          $ref: '#/components/schemas/SuccessResponse'
+  Error:
+    description: Standard error response.
+    content:
+      application/json:
+        schema:
+          $ref: '#/components/schemas/ErrorResponse'
+
