@@ -109,12 +109,10 @@ export const confirmRentalReturn = functions.https.onCall(
         let depositTriggerFailed = false;
 
         try {
-            // Fetch Courier, Booking, Return Box, Rental Item Data Concurrently
+            // Fetch Courier, Booking, Return Box Data Concurrently
             const courierRef = db.collection('users').doc(courierId);
             const bookingRef = db.collection('rentalBookings').doc(bookingId);
             const returnBoxRef = db.collection('boxes').doc(returnBoxId);
-            // Fetching rentalItem is needed to know its ID for inventory update
-            // We can get rentalItemId from the booking later
 
             const hasPermissionPromise = checkPermission(courierId, 'rental:confirm_return', { bookingId, returnBoxId });
 
@@ -165,7 +163,7 @@ export const confirmRentalReturn = functions.https.onCall(
             if (!returnBoxSnap.exists) throw new HttpsError('not-found', `error.box.notFound::${returnBoxId}`, { errorCode: ErrorCode.BoxNotFound });
             returnBoxData = returnBoxSnap.data() as Box;
             if (!returnBoxData.isActive) throw new HttpsError('failed-precondition', `error.box.inactive::${returnBoxId}`, { errorCode: ErrorCode.BoxInactive });
-            // Should we check if courier is assigned to the RETURN box? Yes.
+            // Validate Courier is assigned to the RETURN box
             if (courierData.currentBoxId !== returnBoxId) {
                  logger.error(`${functionName} Courier ${courierId} is not currently assigned to return box ${returnBoxId} (Current: ${courierData.currentBoxId}).`, logContext);
                  return { success: false, error: "error.courier.notAtReturnBox", errorCode: ErrorCode.CourierNotAssignedToBox };
@@ -234,6 +232,7 @@ export const confirmRentalReturn = functions.https.onCall(
                 };
 
                 // Prepare Box Inventory Update (Increment count for the returned item type)
+                // **ASSUMPTION:** Inventory is stored like: box.rentalInventory = { "mat_standard": 5, "mat_large": 2 }
                 const inventoryUpdate = { [`rentalInventory.${rentalItemId}`]: FieldValue.increment(1) };
 
                 // --- Perform Writes ---
