@@ -32,8 +32,11 @@ import { confirmEventAgreement } from './events/confirmEventAgreement';
 import { createGoogleCalendarEvent } from './events/createGoogleCalendarEvent'; // Background function
 import { assignEventResources } from './events/assignEventResources';
 import { updateEventStatus } from './events/updateEventStatus';
-import { cancelEventBooking as cancelEventBookingEvent } from './events/cancelEventBooking'; // <-- Use alias
-// ... import other event functions ...
+import { cancelEventBooking as cancelEventBookingEvent } from './events/cancelEventBooking';
+
+// --- Import RBAC Functions ---
+import { createRole, updateRole, deleteRole, listRoles } from './rbac/manageRoles'; // <-- שורה חדשה
+// ... import other rbac functions ...
 
 // ... import other modules ...
 
@@ -57,7 +60,12 @@ export {
   confirmEventAgreement,
   assignEventResources,
   updateEventStatus,
-  cancelEventBookingEvent, // <-- Use alias
+  cancelEventBookingEvent, // Event cancellation
+  // RBAC
+  createRole, // <-- שורה חדשה
+  updateRole, // <-- שורה חדשה
+  deleteRole, // <-- שורה חדשה
+  listRoles, // <-- שורה חדשה
   // ... export other callable functions ...
 };
 
