@@ -41,6 +41,8 @@ enum ErrorCode {
     InvalidBookingStatus = "INVALID_BOOKING_STATUS", // Not cancellable from this state
     PaymentVoidFailed = "PAYMENT_VOID_FAILED", // Critical failure during void attempt
     TransactionFailed = "TRANSACTION_FAILED",
+    BoxNotFound = "BOX_NOT_FOUND", // Added for TX check
+    InventoryUnavailable = "INVENTORY_UNAVAILABLE", // Should not happen on cancel, but good practice
 }
 
 // --- Interfaces ---
@@ -86,6 +88,7 @@ export const cancelRentalBooking = functions.https.onCall(
         let userRole: string;
         let voidFailed = false;
         let finalPaymentStatus: PaymentStatus | string | null;
+        let userPreferredLanguage: string | undefined; // For notifications
 
         try {
             // Fetch User Role & Booking Data Concurrently
@@ -98,6 +101,7 @@ export const cancelRentalBooking = functions.https.onCall(
             if (!userSnap.exists) throw new HttpsError('not-found', `error.user.notFound::${userId}`, { errorCode: ErrorCode.UserNotFound });
             const userData = userSnap.data() as User;
             userRole = userData.role;
+            userPreferredLanguage = userData.preferredLanguage;
             if (!userData.isActive) throw new HttpsError('permission-denied', "error.user.inactive", { errorCode: ErrorCode.PermissionDenied });
             logContext.userRole = userRole;
 
@@ -178,6 +182,8 @@ export const cancelRentalBooking = functions.https.onCall(
                 if (!bookingTxSnap.exists) throw new Error(`TX_ERR::${ErrorCode.BookingNotFound}`);
                 const bookingTxData = bookingTxSnap.data() as RentalBooking;
 
+                // Validate pickupBoxId exists before creating ref
+                if (!bookingTxData.pickupBoxId) throw new Error(`TX_ERR::Booking ${bookingId} missing pickupBoxId`);
                 const pickupBoxRef = db.collection('boxes').doc(bookingTxData.pickupBoxId);
                 const boxTxSnap = await transaction.get(pickupBoxRef);
                 if (!boxTxSnap.exists) throw new Error(`TX_ERR::${ErrorCode.BoxNotFound}::${bookingTxData.pickupBoxId}`);
@@ -196,7 +202,7 @@ export const cancelRentalBooking = functions.https.onCall(
                     cancelledBy: userRole, // Role of user initiating cancel
                     cancellationTimestamp: now,
                     paymentStatus: finalPaymentStatus, // Set calculated/attempted payment status
-                    updatedAt: FieldValue.serverTimestamp(),
+                    updatedAt: FieldValue.serverTimestamp(), // Use server timestamp for final update
                     processingError: voidFailed ? `Payment void failed, requires manual action.` : null, // Set or clear error
                 };
                  // Update paymentDetails with void status
@@ -212,12 +218,13 @@ export const cancelRentalBooking = functions.https.onCall(
 
                 // Prepare Box Inventory Update (Increment count for the cancelled item type)
                 // **ASSUMPTION:** Inventory is stored like: box.rentalInventory = { "mat_standard": 5, "mat_large": 2 }
+                if (!bookingTxData.rentalItemId) throw new Error(`TX_ERR::Booking ${bookingId} missing rentalItemId for inventory update`);
                 const inventoryUpdate = { [`rentalInventory.${bookingTxData.rentalItemId}`]: FieldValue.increment(1) };
 
                 // --- Perform Writes ---
                 // 1. Update Rental Booking
                 transaction.update(bookingRef, bookingUpdateData);
-                // 2. Update Box Inventory
+                // 2. Update Box Inventory (Only if pickupBoxId exists)
                 transaction.update(pickupBoxRef, inventoryUpdate);
 
             }); // End Firestore Transaction
@@ -225,33 +232,38 @@ export const cancelRentalBooking = functions.https.onCall(
 
 
             // 7. Trigger Async Notifications
-            // Notify Customer
-            if (bookingData.customerId) {
-                 sendPushNotification({
-                     userId: bookingData.customerId, type: "RentalCancelled", titleKey: "notification.rentalCancelled.title",
-                     messageKey: "notification.rentalCancelled.message", messageParams: { bookingIdShort: bookingId.substring(0, 6), reason: reason },
-                     payload: { bookingId: bookingId }
-                 }).catch(err => logger.error("Failed sending customer cancellation notification", { err }));
-            }
-            // Notify Admin if void failed
-            if (voidFailed) {
+            const notificationPromises: Promise<void>[] = [];
+             // Customer Notification
+             if (bookingData.customerId) {
+                 notificationPromises.push(sendPushNotification({
+                     userId: bookingData.customerId, type: "RentalCancelled", langPref: userPreferredLanguage,
+                     titleKey: "notification.rentalCancelled.title", messageKey: "notification.rentalCancelled.message",
+                     messageParams: { bookingIdShort: bookingId.substring(0, 6), reason: reason },
+                     payload: { bookingId }
+                 }).catch(err => logger.error("Failed sending customer cancellation notification", { err })) );
+             }
+             // Notify Admin if void failed
+             if (voidFailed) {
                  // Already sent critical alert inside the void attempt block
-            } else {
+             } else {
                  // Send standard admin notice
-                 sendPushNotification({
+                 notificationPromises.push(sendPushNotification({
                      subject: `Rental Booking Cancelled: ${bookingId.substring(0,6)}`,
                      body: `Rental booking ${bookingId} was cancelled by ${userId} (${userRole}). Reason: ${reason}. Payment Status: ${finalPaymentStatus}.`,
                      bookingId: bookingId, severity: "info", type: "RentalCancelledAdminNotice"
-                 }).catch(err => logger.error("Failed sending admin cancellation notice", { err }));
-            }
+                 }).catch(err => logger.error("Failed sending admin cancellation notice", { err })) );
+             }
+
 
             // 8. Log Action (Async)
             const logDetails = { bookingId, reason, cancelledByRole: userRole, paymentStatusBefore: bookingData.paymentStatus, paymentStatusAfter: finalPaymentStatus, voidAttempted: (bookingData.paymentStatus === PaymentStatus.Authorized && authTxId), voidFailed };
             if (userRole === 'Admin' || userRole === 'SuperAdmin') {
-                logAdminAction("RentalBookingCancelled", logDetails).catch(err => logger.error("Failed logging admin action", { err }));
+                notificationPromises.push(logAdminAction("RentalBookingCancelled", logDetails).catch(err => logger.error("Failed logging admin action", { err })) );
             } else {
-                logUserActivity("CancelRentalBooking", logDetails, userId).catch(err => logger.error("Failed logging user activity", { err }));
+                notificationPromises.push(logUserActivity("CancelRentalBooking", logDetails, userId).catch(err => logger.error("Failed logging user activity", { err })) );
             }
+            Promise.allSettled(notificationPromises);
+
 
             // 9. Return Success
             return { success: true };
