@@ -42,7 +42,10 @@ import { listPermissions, assignRoleToUser } from './rbac/managePermissionsUsers
 import { setUserActiveStatus, adjustBoxInventory } from './admin/manageUsersInventory';
 
 // --- Import Scheduled Functions ---
-import { autoCancelExpiredOrders, deactivateExpiredPromotions, cleanupOldLogs } from './scheduled/scheduledFunctions'; // <-- שורה חדשה (רק import)
+import { autoCancelExpiredOrders, deactivateExpiredPromotions, cleanupOldLogs } from './scheduled/scheduledFunctions'; // Background
+
+// --- Import Utility Functions (Helpers are usually not Cloud Functions themselves) ---
+import { logUserActivity } from './utils/logging'; // <-- שורה חדשה (רק import)
 
 // ... import other modules ...
 
@@ -80,10 +83,12 @@ export {
   // ... export other callable functions ...
 };
 
-// Ensure background/triggered/scheduled functions are loaded for deployment by referencing them.
+// Ensure background/triggered functions are loaded for deployment by referencing them.
 handleRentalDeposit;
 createGoogleCalendarEvent;
-autoCancelExpiredOrders; // <-- שורה חדשה
-deactivateExpiredPromotions; // <-- שורה חדשה
-cleanupOldLogs; // <-- שורה חדשה
+autoCancelExpiredOrders;
+deactivateExpiredPromotions;
+cleanupOldLogs;
+// Note: Utility functions like logUserActivity don't need to be referenced here
+// as they are imported and used by other functions.
 // ... add references for other background/triggered functions ...
