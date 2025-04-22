@@ -31,7 +31,8 @@ import { approveEventBooking } from './events/approveEventBooking';
 import { confirmEventAgreement } from './events/confirmEventAgreement';
 import { createGoogleCalendarEvent } from './events/createGoogleCalendarEvent'; // Background function
 import { assignEventResources } from './events/assignEventResources';
-import { updateEventStatus } from './events/updateEventStatus'; // <-- שורה חדשה
+import { updateEventStatus } from './events/updateEventStatus';
+import { cancelEventBooking as cancelEventBookingEvent } from './events/cancelEventBooking'; // <-- Use alias
 // ... import other event functions ...
 
 // ... import other modules ...
@@ -46,7 +47,7 @@ export {
   createRentalBooking,
   confirmRentalPickup,
   confirmRentalReturn,
-  cancelRentalBooking,
+  cancelRentalBooking, // Rental cancellation
   getAvailableReturnBoxes,
   // Events
   getEventMenus,
@@ -55,7 +56,8 @@ export {
   approveEventBooking,
   confirmEventAgreement,
   assignEventResources,
-  updateEventStatus, // <-- שורה חדשה
+  updateEventStatus,
+  cancelEventBookingEvent, // <-- Use alias
   // ... export other callable functions ...
 };
 
