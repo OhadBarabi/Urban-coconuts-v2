@@ -18,7 +18,8 @@ import { createRentalBooking } from './rentals/createRentalBooking';
 import { confirmRentalPickup } from './rentals/confirmRentalPickup';
 import { confirmRentalReturn } from './rentals/confirmRentalReturn';
 import { handleRentalDeposit } from './rentals/handleRentalDeposit'; // Background function
-import { cancelRentalBooking } from './rentals/cancelRentalBooking'; // <-- שורה חדשה
+import { cancelRentalBooking } from './rentals/cancelRentalBooking';
+import { getAvailableReturnBoxes } from './rentals/getAvailableReturnBoxes'; // <-- שורה חדשה
 
 // ... import other functions as they are added ...
 
@@ -30,7 +31,8 @@ export {
   createRentalBooking,
   confirmRentalPickup,
   confirmRentalReturn,
-  cancelRentalBooking, // <-- שורה חדשה
+  cancelRentalBooking,
+  getAvailableReturnBoxes, // <-- שורה חדשה
   // Note: handleRentalDeposit is a background function, no need to export here
   // ... export other callable functions ...
 };
