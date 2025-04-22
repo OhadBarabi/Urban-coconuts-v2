@@ -10,33 +10,42 @@ if (admin.apps.length === 0) {
   admin.initializeApp();
 }
 
-// Import functions from their respective files
+// --- Import Core Functions ---
 import { createOrder } from './core/createOrder';
 import { updateOrderStatus } from './core/updateOrderStatus';
+
+// --- Import Rentals Functions ---
 import { getAvailableRentalItems } from './rentals/getAvailableRentalItems';
 import { createRentalBooking } from './rentals/createRentalBooking';
 import { confirmRentalPickup } from './rentals/confirmRentalPickup';
 import { confirmRentalReturn } from './rentals/confirmRentalReturn';
 import { handleRentalDeposit } from './rentals/handleRentalDeposit'; // Background function
 import { cancelRentalBooking } from './rentals/cancelRentalBooking';
-import { getAvailableReturnBoxes } from './rentals/getAvailableReturnBoxes'; // <-- שורה חדשה
+import { getAvailableReturnBoxes } from './rentals/getAvailableReturnBoxes';
 
-// ... import other functions as they are added ...
+// --- Import Events Functions ---
+import { getEventMenus } from './events/getEventMenus'; // <-- שורה חדשה
+// ... import other event functions ...
+
+// ... import other modules ...
 
 // Export HTTPS Callable functions for deployment
 export {
+  // Core
   createOrder,
   updateOrderStatus,
+  // Rentals
   getAvailableRentalItems,
   createRentalBooking,
   confirmRentalPickup,
   confirmRentalReturn,
   cancelRentalBooking,
-  getAvailableReturnBoxes, // <-- שורה חדשה
-  // Note: handleRentalDeposit is a background function, no need to export here
+  getAvailableReturnBoxes,
+  // Events
+  getEventMenus, // <-- שורה חדשה
   // ... export other callable functions ...
 };
 
-// Ensure background functions are loaded for deployment by referencing them.
+// Ensure background/triggered functions are loaded for deployment by referencing them.
 handleRentalDeposit;
-// ... add references for other background functions ...
+// ... add references for other background/triggered functions ...
