@@ -28,7 +28,8 @@ import { getEventMenus } from './events/getEventMenus';
 import { checkEventAvailability } from './events/checkEventAvailability';
 import { createEventBooking } from './events/createEventBooking';
 import { approveEventBooking } from './events/approveEventBooking';
-import { confirmEventAgreement } from './events/confirmEventAgreement'; // <-- שורה חדשה
+import { confirmEventAgreement } from './events/confirmEventAgreement';
+import { createGoogleCalendarEvent } from './events/createGoogleCalendarEvent'; // <-- שורה חדשה (רק import)
 // ... import other event functions ...
 
 // ... import other modules ...
@@ -50,10 +51,11 @@ export {
   checkEventAvailability,
   createEventBooking,
   approveEventBooking,
-  confirmEventAgreement, // <-- שורה חדשה
+  confirmEventAgreement,
   // ... export other callable functions ...
 };
 
 // Ensure background/triggered functions are loaded for deployment by referencing them.
 handleRentalDeposit;
+createGoogleCalendarEvent; // <-- שורה חדשה
 // ... add references for other background/triggered functions ...
