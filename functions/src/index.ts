@@ -30,7 +30,8 @@ import { createEventBooking } from './events/createEventBooking';
 import { approveEventBooking } from './events/approveEventBooking';
 import { confirmEventAgreement } from './events/confirmEventAgreement';
 import { createGoogleCalendarEvent } from './events/createGoogleCalendarEvent'; // Background function
-import { assignEventResources } from './events/assignEventResources'; // <-- שורה חדשה
+import { assignEventResources } from './events/assignEventResources';
+import { updateEventStatus } from './events/updateEventStatus'; // <-- שורה חדשה
 // ... import other event functions ...
 
 // ... import other modules ...
@@ -53,7 +54,8 @@ export {
   createEventBooking,
   approveEventBooking,
   confirmEventAgreement,
-  assignEventResources, // <-- שורה חדשה
+  assignEventResources,
+  updateEventStatus, // <-- שורה חדשה
   // ... export other callable functions ...
 };
 
