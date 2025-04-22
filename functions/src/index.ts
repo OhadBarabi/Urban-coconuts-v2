@@ -14,7 +14,8 @@ if (admin.apps.length === 0) {
 import { createOrder } from './core/createOrder';
 import { updateOrderStatus } from './core/updateOrderStatus';
 import { getAvailableRentalItems } from './rentals/getAvailableRentalItems';
-import { createRentalBooking } from './rentals/createRentalBooking'; // <-- שורה חדשה
+import { createRentalBooking } from './rentals/createRentalBooking';
+import { confirmRentalPickup } from './rentals/confirmRentalPickup'; // <-- שורה חדשה
 // ... import other functions as they are added ...
 
 // Export functions for deployment
@@ -22,6 +23,7 @@ export {
   createOrder,
   updateOrderStatus,
   getAvailableRentalItems,
-  createRentalBooking, // <-- שורה חדשה
+  createRentalBooking,
+  confirmRentalPickup, // <-- שורה חדשה
   // ... export other functions ...
 };
