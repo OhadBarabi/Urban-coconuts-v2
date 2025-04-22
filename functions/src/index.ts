@@ -44,8 +44,11 @@ import { setUserActiveStatus, adjustBoxInventory } from './admin/manageUsersInve
 // --- Import Scheduled Functions ---
 import { autoCancelExpiredOrders, deactivateExpiredPromotions, cleanupOldLogs } from './scheduled/scheduledFunctions'; // Background
 
+// --- Import Auth Functions ---
+import { sendOtp } from './auth/sendOtp'; // <-- שורה חדשה
+
 // --- Import Utility Functions (Helpers are usually not Cloud Functions themselves) ---
-import { logUserActivity } from './utils/logging'; // <-- שורה חדשה (רק import)
+import { logUserActivity } from './utils/logging';
 
 // ... import other modules ...
 
@@ -80,6 +83,8 @@ export {
   // Admin
   setUserActiveStatus,
   adjustBoxInventory,
+  // Auth
+  sendOtp, // <-- שורה חדשה
   // ... export other callable functions ...
 };
 
