@@ -49,7 +49,8 @@ import { listPermissions, assignRoleToUser } from './rbac/managePermissionsUsers
 // --- Import Admin Functions ---
 import { setUserActiveStatus, adjustBoxInventory } from './admin/manageUsersInventory';
 import { createPromoCode, updatePromoCode, deletePromoCode, listPromoCodes } from './admin/managePromoCodes';
-import { createProduct, updateProduct, listProducts, setProductActiveStatus } from './admin/manageProduct'; // <-- שורות חדשות
+import { createProduct, updateProduct, listProducts, setProductActiveStatus } from './admin/manageProduct';
+import { createMenu, updateMenu, listMenus, setMenuActiveStatus } from './admin/manageMenu'; // <-- שורות חדשות
 
 // --- Import Scheduled Functions ---
 import { autoCancelExpiredOrders, deactivateExpiredPromotions, cleanupOldLogs } from './scheduled/scheduledFunctions'; // Background
@@ -107,10 +108,14 @@ export {
   updatePromoCode,
   deletePromoCode,
   listPromoCodes,
-  createProduct, // <-- שורה חדשה
-  updateProduct, // <-- שורה חדשה
-  listProducts, // <-- שורה חדשה
-  setProductActiveStatus, // <-- שורה חדשה
+  createProduct,
+  updateProduct,
+  listProducts,
+  setProductActiveStatus,
+  createMenu, // <-- שורה חדשה
+  updateMenu, // <-- שורה חדשה
+  listMenus, // <-- שורה חדשה
+  setMenuActiveStatus, // <-- שורה חדשה
   // Auth
   sendOtp,
   verifyOtp,
