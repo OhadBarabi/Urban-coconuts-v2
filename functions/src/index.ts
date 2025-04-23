@@ -36,11 +36,11 @@ import { confirmEventAgreement } from './events/confirmEventAgreement';
 import { createGoogleCalendarEvent } from './events/createGoogleCalendarEvent'; // Background function
 import { assignEventResources } from './events/assignEventResources';
 import { updateEventStatus } from './events/updateEventStatus';
-import { cancelEventBooking as cancelEventBookingEvent } from './events/cancelEventBooking';
+import { cancelEventBooking } from './events/cancelEventBooking'; // Renamed export
 
 // --- Import Courier Functions ---
 import { startShift } from './courier/startShift';
-import { endShift } from './courier/endShift'; // <-- שורה חדשה
+import { endShift } from './courier/endShift';
 
 // --- Import RBAC Functions ---
 import { createRole, updateRole, deleteRole, listRoles } from './rbac/manageRoles';
@@ -49,6 +49,7 @@ import { listPermissions, assignRoleToUser } from './rbac/managePermissionsUsers
 // --- Import Admin Functions ---
 import { setUserActiveStatus, adjustBoxInventory } from './admin/manageUsersInventory';
 import { createPromoCode, updatePromoCode, deletePromoCode, listPromoCodes } from './admin/managePromoCodes';
+import { createProduct, updateProduct, listProducts, setProductActiveStatus } from './admin/manageProduct'; // <-- שורות חדשות
 
 // --- Import Scheduled Functions ---
 import { autoCancelExpiredOrders, deactivateExpiredPromotions, cleanupOldLogs } from './scheduled/scheduledFunctions'; // Background
@@ -61,7 +62,7 @@ import { verifyOtp } from './auth/verifyOtp';
 import { generateMfaSetup, verifyMfaSetup, disableMfa, verifyMfaLogin } from './auth/manageMfa';
 
 // --- Import Utility Functions (Helpers are usually not Cloud Functions themselves) ---
-import { logUserActivity } from './utils/logging';
+// Helpers like payment, encryption, permissions, gcal, notifications, logging are imported by the functions that use them.
 
 // ... import other modules ...
 
@@ -88,10 +89,10 @@ export {
   confirmEventAgreement,
   assignEventResources,
   updateEventStatus,
-  cancelEventBookingEvent, // Event cancellation
+  cancelEventBooking, // Event cancellation
   // Courier
   startShift,
-  endShift, // <-- שורה חדשה
+  endShift,
   // RBAC
   createRole,
   updateRole,
@@ -106,6 +107,10 @@ export {
   updatePromoCode,
   deletePromoCode,
   listPromoCodes,
+  createProduct, // <-- שורה חדשה
+  updateProduct, // <-- שורה חדשה
+  listProducts, // <-- שורה חדשה
+  setProductActiveStatus, // <-- שורה חדשה
   // Auth
   sendOtp,
   verifyOtp,
@@ -117,14 +122,12 @@ export {
 };
 
 // Ensure background/triggered functions are loaded for deployment by referencing them.
+handleOrderCancellationSideEffects;
 handleRentalDeposit;
 createGoogleCalendarEvent;
 autoCancelExpiredOrders;
 deactivateExpiredPromotions;
 cleanupOldLogs;
-handleOrderCancellationSideEffects;
 calculateVipTiers;
 generateDailySalesReport;
-// Note: Utility functions like logUserActivity don't need to be referenced here
-// as they are imported and used by other functions.
 // ... add references for other background/triggered functions ...
