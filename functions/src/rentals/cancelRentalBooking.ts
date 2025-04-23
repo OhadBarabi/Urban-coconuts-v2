@@ -9,13 +9,11 @@ import {
 } from '../models'; // Adjust path if needed
 
 // --- Import Helpers ---
-// import { checkPermission } from '../utils/permissions'; // Still using mock below
-import { voidAuthorization } from '../utils/payment_helpers'; // <-- Import from new helper
+import { checkPermission } from '../utils/permissions'; // <-- Import REAL helper
+import { voidAuthorization } from '../utils/payment_helpers';
 // import { logUserActivity, logAdminAction } from '../utils/logging'; // Still using mock below
 
-// --- Mocks for required helper functions (Replace with actual implementations) ---
-async function checkPermission(userId: string | null, userRole: string | null, permissionId: string, context?: any): Promise<boolean> { logger.info(`[Mock Auth] Check ${permissionId} for ${userId} (${userRole})`, context); return userId != null; }
-// voidAuthorization is now imported from the helper
+// --- Mocks for other required helper functions (Replace with actual implementations) ---
 async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); }
 async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); }
 // --- End Mocks ---
@@ -41,7 +39,7 @@ enum ErrorCode {
     PaymentVoidFailed = "PAYMENT_VOID_FAILED",
     MissingPaymentInfo = "MISSING_PAYMENT_INFO", // Missing authId for void
     TransactionFailed = "TRANSACTION_FAILED",
-    BoxNotFound = "BOX_NOT_FOUND", // Needed for inventory return
+    BoxNotFound = "BOX_NOT_FOUND",
 }
 
 // --- Interfaces ---
@@ -59,7 +57,7 @@ export const cancelRentalBooking = functions.https.onCall(
         // secrets: ["PAYMENT_GATEWAY_SECRET"], // Uncomment if payment helper needs secrets
     },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[cancelRentalBooking V2 - Refactored]";
+        const functionName = "[cancelRentalBooking V3 - Permissions]"; // Updated version name
         const startTimeFunc = Date.now();
 
         // 1. Authentication & Authorization
@@ -82,7 +80,7 @@ export const cancelRentalBooking = functions.https.onCall(
         // --- Variables ---
         let bookingData: RentalBooking;
         let userData: User;
-        let userRole: string | null;
+        let userRole: string | null; // Fetch role
         let voidResult: Awaited<ReturnType<typeof voidAuthorization>> | null = null;
         let updatedPaymentStatus: PaymentStatus;
 
@@ -97,7 +95,7 @@ export const cancelRentalBooking = functions.https.onCall(
             // Validate User
             if (!userSnap.exists) throw new HttpsError('not-found', `error.user.notFound::${userId}`, { errorCode: ErrorCode.UserNotFound });
             userData = userSnap.data() as User;
-            userRole = userData.role;
+            userRole = userData.role; // Get role
             logContext.userRole = userRole;
 
             // Validate Booking
@@ -109,79 +107,70 @@ export const cancelRentalBooking = functions.https.onCall(
             logContext.currentStatus = bookingData.bookingStatus;
             logContext.paymentStatus = bookingData.paymentStatus;
             logContext.bookingCustomerId = bookingData.customerId;
-            logContext.pickupBoxId = bookingData.pickupBoxId; // Needed for inventory return
-            logContext.rentalItemId = bookingData.rentalItemId; // Needed for inventory return
+            logContext.pickupBoxId = bookingData.pickupBoxId;
+            logContext.rentalItemId = bookingData.rentalItemId;
 
-            // 4. Permission Check (Allow owner or admin?)
+            // 4. Permission Check (Using REAL helper)
             const isOwner = userId === bookingData.customerId;
             const isAdmin = userRole === 'Admin' || userRole === 'SuperAdmin';
             const requiredPermission = isOwner ? 'rental:cancel:own' : (isAdmin ? 'rental:cancel:any' : 'permission_denied');
-            const hasPermission = await checkPermission(userId, userRole, requiredPermission, { bookingId });
+            // Pass fetched role to checkPermission
+            const hasPermission = await checkPermission(userId, userRole, requiredPermission, logContext);
 
             if (!hasPermission) {
                 logger.warn(`${functionName} Permission denied for user ${userId} (Role: ${userRole}) to cancel rental booking ${bookingId}.`, logContext);
-                return { success: false, error: "error.permissionDenied.cancelRental", errorCode: ErrorCode.NotBookingOwnerOrAdmin };
+                const errorCode = (requiredPermission === 'permission_denied') ? ErrorCode.PermissionDenied : ErrorCode.NotBookingOwnerOrAdmin;
+                return { success: false, error: "error.permissionDenied.cancelRental", errorCode: errorCode };
             }
 
-            // 5. State Validation (Allow cancellation only in specific states)
-            // Example: Allow cancelling 'PendingPickup'. Maybe 'Confirmed' if pickup hasn't happened.
-            const cancellableStatuses: string[] = [RentalBookingStatus.PendingPickup.toString() /*, RentalBookingStatus.Confirmed.toString() */ ]; // Add more statuses if needed
+            // 5. State Validation - Logic remains the same as V2
+            const cancellableStatuses: string[] = [RentalBookingStatus.PendingPickup.toString()];
             if (!cancellableStatuses.includes(bookingData.bookingStatus)) {
                 logger.warn(`${functionName} Rental booking ${bookingId} cannot be cancelled from status '${bookingData.bookingStatus}'.`, logContext);
                 return { success: false, error: `error.rental.invalidStatus.cancel::${bookingData.bookingStatus}`, errorCode: ErrorCode.InvalidBookingStatus };
             }
-             // Check if already cancelled
              if (bookingData.bookingStatus === RentalBookingStatus.Cancelled) {
                   logger.warn(`${functionName} Rental booking ${bookingId} is already cancelled.`, logContext);
                   return { success: false, error: "error.rental.alreadyCancelled", errorCode: ErrorCode.FailedPrecondition };
              }
 
-            // 6. Handle Payment Void (if applicable)
-            updatedPaymentStatus = bookingData.paymentStatus; // Start with current status
+            // 6. Handle Payment Void (if applicable) - Logic remains the same as V2
+            updatedPaymentStatus = bookingData.paymentStatus;
 
             if (bookingData.paymentStatus === PaymentStatus.Authorized) {
-                // --- Void Deposit Authorization ---
                 const authId = bookingData.paymentDetails?.authorizationId;
                 if (!authId) {
-                    logger.error(`${functionName} Cannot void deposit for booking ${bookingId}: Missing authorizationId in paymentDetails.`, logContext);
                     throw new HttpsError('internal', `error.internal.missingPaymentInfo::${bookingId}`, { errorCode: ErrorCode.MissingPaymentInfo });
                 }
                 logger.info(`${functionName} Booking ${bookingId}: Deposit is Authorized. Attempting to void authorization ${authId}...`, logContext);
                 voidResult = await voidAuthorization(authId);
-
+                updatedPaymentStatus = voidResult.success ? PaymentStatus.Voided : PaymentStatus.VoidFailed;
                 if (!voidResult.success) {
-                    updatedPaymentStatus = PaymentStatus.VoidFailed; // Mark as failed
                     logger.error(`${functionName} Deposit void failed for booking ${bookingId}, AuthID: ${authId}.`, { ...logContext, error: voidResult.errorMessage, code: voidResult.errorCode });
-                    // Still cancel the booking, but mark payment status.
                 } else {
-                    updatedPaymentStatus = PaymentStatus.Voided;
                     logger.info(`${functionName} Deposit void successful for booking ${bookingId}, AuthID: ${authId}.`, logContext);
                 }
             } else if (bookingData.paymentStatus === PaymentStatus.Captured || bookingData.paymentStatus === PaymentStatus.Paid) {
-                // Refunding captured deposit during cancellation is less common, usually handled after return.
-                // If needed, logic similar to cancelOrder's refund would go here.
                 logger.warn(`${functionName} Booking ${bookingId}: Deposit payment status is ${bookingData.paymentStatus}. Cancellation does not automatically trigger refund at this stage.`, logContext);
             } else {
                 logger.info(`${functionName} Booking ${bookingId}: No payment action required for cancellation based on current payment status '${bookingData.paymentStatus}'.`, logContext);
             }
             logContext.updatedPaymentStatus = updatedPaymentStatus;
 
-            // 7. Firestore Transaction to Update Booking Status and Restore Inventory
+            // 7. Firestore Transaction to Update Booking Status and Restore Inventory - Logic remains the same as V2
             logger.info(`${functionName} Starting Firestore transaction to update booking status and inventory...`, logContext);
-            const boxRef = db.collection('boxes').doc(bookingData.pickupBoxId); // Ref to the pickup box
+            const boxRef = db.collection('boxes').doc(bookingData.pickupBoxId);
 
             await db.runTransaction(async (transaction) => {
                 const [bookingTxSnap, boxTxSnap] = await Promise.all([
                     transaction.get(bookingRef),
-                    transaction.get(boxRef) // Read box for inventory update
+                    transaction.get(boxRef)
                 ]);
 
                 if (!bookingTxSnap.exists) throw new Error(`TX_ERR::${ErrorCode.BookingNotFound}`);
                 if (!boxTxSnap.exists) throw new Error(`TX_ERR::${ErrorCode.BoxNotFound}::${bookingData.pickupBoxId}`);
                 const bookingTxData = bookingTxSnap.data() as RentalBooking;
-                // const boxTxData = boxTxSnap.data() as Box; // Not strictly needed for write
 
-                // Re-validate status in transaction
                 if (bookingTxData.bookingStatus === RentalBookingStatus.Cancelled) {
                     logger.warn(`${functionName} TX Conflict: Booking ${bookingId} was already cancelled. Aborting update.`);
                     return;
@@ -191,41 +180,32 @@ export const cancelRentalBooking = functions.https.onCall(
                      return;
                 }
 
-                // --- Prepare Booking Update ---
                 const now = Timestamp.now();
                 const updateData: { [key: string]: any } = {
                     bookingStatus: RentalBookingStatus.Cancelled,
-                    paymentStatus: updatedPaymentStatus, // Update based on void result
+                    paymentStatus: updatedPaymentStatus,
                     updatedAt: FieldValue.serverTimestamp(),
-                    // Add cancellation reason/timestamp?
                     cancellationTimestamp: now,
                     cancelledBy: userId,
                     cancellationReason: reason || null,
-                    processingError: null, // Clear previous errors
+                    processingError: null,
                 };
-                 // Add void failure details?
                  if (voidResult && !voidResult.success) {
                      updateData['paymentDetails.voidErrorCode'] = voidResult.errorCode;
                      updateData['paymentDetails.voidErrorMessage'] = voidResult.errorMessage;
                  }
 
-                // --- Prepare Inventory Update ---
-                // Return the item to the pickup box's inventory
                 const inventoryUpdate = {
                     [`rentalInventory.${bookingData.rentalItemId}`]: FieldValue.increment(1)
                 };
 
-                // --- Perform Writes ---
-                // 1. Update Booking Document
                 transaction.update(bookingRef, updateData);
-                // 2. Update Box Inventory
                 transaction.update(boxRef, inventoryUpdate);
 
-            }); // End Transaction
+            });
             logger.info(`${functionName} Transaction successful. Rental booking ${bookingId} cancelled and inventory restored.`, logContext);
 
-
-            // 8. Log Action (Async)
+            // 8. Log Action (Async) - Logic remains the same as V2
             const logDetails = { bookingId, customerId: bookingData.customerId, cancelledBy: userId, userRole, reason, initialStatus: bookingData.bookingStatus, finalPaymentStatus: updatedPaymentStatus };
             if (isAdmin) {
                 logAdminAction("CancelRentalBooking", logDetails).catch(err => logger.error("Failed logging admin action", { err }));
@@ -233,11 +213,11 @@ export const cancelRentalBooking = functions.https.onCall(
                 logUserActivity("CancelRentalBooking", logDetails, userId).catch(err => logger.error("Failed logging user activity", { err }));
             }
 
-            // 9. Return Success
+            // 9. Return Success - Logic remains the same as V2
             return { success: true };
 
         } catch (error: any) {
-            // Error Handling
+            // Error Handling - Logic remains the same as V2
             logger.error(`${functionName} Execution failed.`, { ...logContext, error: error?.message, details: error?.details });
             const isHttpsError = error instanceof HttpsError;
             let finalErrorCode: ErrorCode = ErrorCode.InternalError;
@@ -256,7 +236,6 @@ export const cancelRentalBooking = functions.https.onCall(
                  if (parts[2]) finalErrorMessageKey += `::${parts[2]}`;
             }
 
-            // Log failure activity?
             logUserActivity("CancelRentalBookingFailed", { bookingId, reason, error: error.message }, userId).catch(...)
 
             return { success: false, error: finalErrorMessageKey, errorCode: finalErrorCode };
