@@ -9,12 +9,11 @@ import * as qrcode from 'qrcode';
 import { User } from '../models'; // Adjust path if needed
 
 // --- Import Helpers ---
-import { encryptMfaSecret, decryptMfaSecret } from '../utils/encryption'; // <-- Import from new helper
-// import { checkPermission } from '../utils/permissions'; // Still using mock below
+import { encryptMfaSecret, decryptMfaSecret } from '../utils/encryption';
+// import { checkPermission } from '../utils/permissions'; // No specific permission needed beyond auth for these user actions
 // import { logUserActivity, logAdminAction } from '../utils/logging'; // Using mocks below
 
-// --- Mocks for required helper functions (Replace with actual implementations) ---
-async function checkPermission(userId: string | null, userRole: string | null, permissionId: string, context?: any): Promise<boolean> { logger.info(`[Mock Auth] Check ${permissionId} for ${userId} (${userRole})`, context); return userId != null; } // Basic check for now
+// --- Mocks for other required helper functions (Replace with actual implementations) ---
 async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); }
 async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); }
 // --- End Mocks ---
@@ -60,29 +59,22 @@ interface VerifyMfaInput {
 export const generateMfaSetup = functions.https.onCall(
     { region: FUNCTION_REGION, memory: "256MiB" },
     async (request): Promise<{ success: true; data: GenerateMfaSetupOutput } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[generateMfaSetup V2 - Refactored]";
+        const functionName = "[generateMfaSetup V3 - Permissions]"; // Updated version name
         const startTimeFunc = Date.now();
 
-        // 1. Authentication
+        // 1. Authentication (Implicitly checked by onCall)
         if (!request.auth?.uid) { return { success: false, error: "error.auth.unauthenticated", errorCode: ErrorCode.Unauthenticated }; }
         const userId = request.auth.uid;
         const logContext: any = { userId };
         logger.info(`${functionName} Invoked.`, logContext);
 
-        // Optional: Check if MFA is already enabled for the user?
-        // const userRef = db.collection('users').doc(userId);
-        // const userSnap = await userRef.get();
-        // if (userSnap.exists && userSnap.data()?.isMfaEnabled) {
-        //     logger.warn(`${functionName} User ${userId} attempted to generate setup but MFA is already enabled.`, logContext);
-        //     // Decide: Allow regenerating? Or return error? Let's allow regenerating for now.
-        //     // return { success: false, error: "error.mfa.alreadyEnabled", errorCode: ErrorCode.MfaAlreadyEnabled };
-        // }
+        // No specific permission check needed beyond being authenticated
 
         try {
             // 2. Generate Speakeasy Secret
             const secret = speakeasy.generateSecret({
-                length: 20, // Standard length
-                name: `${MFA_ISSUER_NAME} (${userId})` // Include user ID or email in issuer name shown in app
+                length: 20,
+                name: `${MFA_ISSUER_NAME} (${userId})`
             });
             logContext.secretGenerated = true;
 
@@ -93,9 +85,9 @@ export const generateMfaSetup = functions.https.onCall(
             const qrCodeDataUrl = await qrcode.toDataURL(secret.otpauth_url);
             logContext.qrCodeGenerated = true;
 
-            // 4. Return Setup Data (DO NOT SAVE SECRET YET - only after verification)
+            // 4. Return Setup Data
             const resultData: GenerateMfaSetupOutput = {
-                secret: secret.base32, // Raw secret for manual entry
+                secret: secret.base32,
                 otpAuthUrl: secret.otpauth_url,
                 qrCodeDataUrl: qrCodeDataUrl,
             };
@@ -120,20 +112,16 @@ export const generateMfaSetup = functions.https.onCall(
 // ============================================================================
 // === Verify MFA Setup =======================================================
 // ============================================================================
-/**
- * Verifies the TOTP token provided by the user during setup and saves the
- * encrypted secret if verification is successful.
- */
 export const verifyMfaSetup = functions.https.onCall(
-    { region: FUNCTION_REGION, memory: "512MiB" }, // Increased memory for encryption call
+    { region: FUNCTION_REGION, memory: "512MiB" },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[verifyMfaSetup V2 - Refactored]";
+        const functionName = "[verifyMfaSetup V3 - Permissions]"; // Updated version name
         const startTimeFunc = Date.now();
 
         // 1. Authentication
         if (!request.auth?.uid) { return { success: false, error: "error.auth.unauthenticated", errorCode: ErrorCode.Unauthenticated }; }
         const userId = request.auth.uid;
-        const data = request.data as VerifyMfaInput & { secret: string }; // Expect token AND the secret generated previously
+        const data = request.data as VerifyMfaInput & { secret: string };
         const logContext: any = { userId };
 
         logger.info(`${functionName} Invoked.`, logContext);
@@ -145,15 +133,14 @@ export const verifyMfaSetup = functions.https.onCall(
             logger.error(`${functionName} Invalid input data structure or types.`, { ...logContext, hasToken: !!data?.token, hasSecret: !!data?.secret });
             return { success: false, error: "error.invalidInput.mfaTokenOrSecret", errorCode: ErrorCode.InvalidArgument };
         }
-        const { token, secret } = data; // The BASE32 secret generated in the previous step
+        const { token, secret } = data;
+
+        // No specific permission check needed beyond being authenticated
 
         try {
             // 3. Verify Token against the provided Secret
             const verified = speakeasy.totp.verify({
-                secret: secret, // Use the BASE32 secret provided by the client
-                encoding: 'base32',
-                token: token,
-                window: 1 // Allow a 30-second window variance (1 step before or after)
+                secret: secret, encoding: 'base32', token: token, window: 1
             });
 
             if (!verified) {
@@ -164,7 +151,7 @@ export const verifyMfaSetup = functions.https.onCall(
 
             // 4. Encrypt the Secret using the helper
             logger.info(`${functionName} Encrypting MFA secret for user ${userId}...`, logContext);
-            const encryptionResult = await encryptMfaSecret(secret, userId); // Pass userId as AAD context
+            const encryptionResult = await encryptMfaSecret(secret, userId);
 
             if (!encryptionResult.success || !encryptionResult.encryptedData) {
                 logger.error(`${functionName} Failed to encrypt MFA secret for user ${userId}.`, { ...logContext, error: encryptionResult.error });
@@ -177,7 +164,7 @@ export const verifyMfaSetup = functions.https.onCall(
             const userRef = db.collection('users').doc(userId);
             await userRef.update({
                 isMfaEnabled: true,
-                mfaSecret: encryptedSecret, // Store the ENCRYPTED secret
+                mfaSecret: encryptedSecret,
                 updatedAt: FieldValue.serverTimestamp()
             });
 
@@ -196,7 +183,7 @@ export const verifyMfaSetup = functions.https.onCall(
             if (error instanceof HttpsError && error.details?.errorCode) {
                  finalErrorCode = error.details.errorCode as ErrorCode;
                  if (finalErrorCode === ErrorCode.EncryptionFailed) finalErrorMessageKey = "error.mfa.encryptionFailed";
-            } else if (error.message.includes("verify")) { // Basic check
+            } else if (error.message.includes("verify")) {
                  finalErrorCode = ErrorCode.InvalidMfaToken;
                  finalErrorMessageKey = "error.mfa.invalidToken";
             }
@@ -217,7 +204,7 @@ export const verifyMfaSetup = functions.https.onCall(
 export const disableMfa = functions.https.onCall(
     { region: FUNCTION_REGION, memory: "128MiB" },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[disableMfa V2 - Refactored]";
+        const functionName = "[disableMfa V3 - Permissions]"; // Updated version name
         const startTimeFunc = Date.now();
 
         // 1. Authentication
@@ -225,6 +212,8 @@ export const disableMfa = functions.https.onCall(
         const userId = request.auth.uid;
         const logContext: any = { userId };
         logger.info(`${functionName} Invoked.`, logContext);
+
+        // No specific permission check needed beyond being authenticated
 
         try {
             // 2. Fetch User Data to check current status
@@ -240,7 +229,7 @@ export const disableMfa = functions.https.onCall(
             // 3. Update User Document
             await userRef.update({
                 isMfaEnabled: false,
-                mfaSecret: FieldValue.delete(), // Remove the encrypted secret
+                mfaSecret: FieldValue.delete(),
                 updatedAt: FieldValue.serverTimestamp()
             });
 
@@ -269,16 +258,13 @@ export const disableMfa = functions.https.onCall(
 // ============================================================================
 // === Verify MFA Login =======================================================
 // ============================================================================
-/**
- * Verifies the TOTP token provided by the user during login (after primary auth).
- */
 export const verifyMfaLogin = functions.https.onCall(
-    { region: FUNCTION_REGION, memory: "512MiB" }, // Increased memory for decryption call
+    { region: FUNCTION_REGION, memory: "512MiB" },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[verifyMfaLogin V2 - Refactored]";
+        const functionName = "[verifyMfaLogin V3 - Permissions]"; // Updated version name
         const startTimeFunc = Date.now();
 
-        // 1. Authentication (User should already be authenticated via primary method)
+        // 1. Authentication
         if (!request.auth?.uid) { return { success: false, error: "error.auth.unauthenticated", errorCode: ErrorCode.Unauthenticated }; }
         const userId = request.auth.uid;
         const data = request.data as VerifyMfaInput;
@@ -293,8 +279,10 @@ export const verifyMfaLogin = functions.https.onCall(
         }
         const { token } = data;
 
+        // No specific permission check needed beyond being authenticated
+
         try {
-            // 3. Fetch User Data (including encrypted secret)
+            // 3. Fetch User Data
             const userRef = db.collection('users').doc(userId);
             const userSnap = await userRef.get();
 
@@ -303,7 +291,6 @@ export const verifyMfaLogin = functions.https.onCall(
 
             if (!userData.isMfaEnabled || !userData.mfaSecret) {
                 logger.error(`${functionName} MFA verification requested for user ${userId}, but MFA is not enabled or secret is missing.`, logContext);
-                // This should ideally be caught client-side, but handle defensively.
                 return { success: false, error: "error.mfa.notEnabled", errorCode: ErrorCode.MfaNotEnabled };
             }
             const encryptedSecret = userData.mfaSecret;
@@ -311,11 +298,10 @@ export const verifyMfaLogin = functions.https.onCall(
 
             // 4. Decrypt the Secret using the helper
             logger.info(`${functionName} Decrypting MFA secret for user ${userId}...`, logContext);
-            const decryptionResult = await decryptMfaSecret(encryptedSecret, userId); // Pass userId as AAD context
+            const decryptionResult = await decryptMfaSecret(encryptedSecret, userId);
 
             if (!decryptionResult.success || !decryptionResult.decryptedData) {
                 logger.error(`${functionName} Failed to decrypt MFA secret for user ${userId}. Potential tampering or key issue?`, { ...logContext, error: decryptionResult.error });
-                // Log critical security event?
                 throw new HttpsError('internal', "Failed to decrypt secret", { errorCode: ErrorCode.DecryptionFailed });
             }
             const decryptedSecret = decryptionResult.decryptedData;
@@ -323,22 +309,15 @@ export const verifyMfaLogin = functions.https.onCall(
 
             // 5. Verify Token against the Decrypted Secret
             const verified = speakeasy.totp.verify({
-                secret: decryptedSecret, // Use the decrypted BASE32 secret
-                encoding: 'base32',
-                token: token,
-                window: 1 // Allow a 30-second window variance
+                secret: decryptedSecret, encoding: 'base32', token: token, window: 1
             });
 
             if (!verified) {
                 logger.warn(`${functionName} MFA login verification failed for user ${userId}. Invalid token.`, logContext);
-                 // Log failed login attempt?
                  logUserActivity("MfaLoginFailed", { reason: "Invalid Token" }, userId).catch(...)
                 return { success: false, error: "error.mfa.invalidToken", errorCode: ErrorCode.InvalidMfaToken };
             }
             logContext.tokenVerified = true;
-
-            // 6. MFA Verification Successful - Update last login timestamp? (Optional)
-            // await userRef.update({ lastLoginTimestamp: FieldValue.serverTimestamp() }); // Consider if this belongs here or after client confirms login
 
             logger.info(`${functionName} MFA login verification successful for user ${userId}.`, logContext);
 
