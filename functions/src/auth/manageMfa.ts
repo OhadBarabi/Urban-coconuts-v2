@@ -293,7 +293,7 @@ export const verifyMfaLogin = functions.https.onCall(
         // The UID from the authenticated context is the user we need to verify MFA for.
         if (!request.auth?.uid) { return { success: false, error: "error.auth.unauthenticated", errorCode: ErrorCode.Unauthenticated }; }
         const userId = request.auth.uid;
-        const data = request.data as VerifyMfaSetupInput; // Re-use the same input interface
+        const data = request.data as VerifyMfaLoginInput; // Use new interface if needed, but VerifyMfaSetupInput works
         const logContext: any = { userId };
         logger.info(`${functionName} Invoked.`, logContext);
 
@@ -324,7 +324,6 @@ export const verifyMfaLogin = functions.https.onCall(
             }
             if (!encryptedMfaSecret) {
                 logger.error(`${functionName} MFA is enabled but secret is missing for user ${userId}. Critical inconsistency.`, logContext);
-                // This indicates a problem - MFA is enabled but the secret wasn't stored correctly.
                 return { success: false, error: "error.mfa.missingSecret", errorCode: ErrorCode.MissingMfaSecret };
             }
 
@@ -361,16 +360,12 @@ export const verifyMfaLogin = functions.https.onCall(
             }
 
             // 7. Verification Successful - Update Last Login Time? (Optional)
-            // Primary auth might have already updated it. Doing it again here might be redundant
-            // but confirms MFA step completion time.
             // await userRef.update({ lastLoginTimestamp: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() });
 
             // 8. Log Success Activity (Async)
             logUserActivity("VerifyMfaLoginSuccess", { success: true }, userId).catch(err => logger.error("Failed logging activity", { err }));
 
             // 9. Return Success
-            // The client now knows the MFA step is complete and can proceed into the app.
-            // No token needs to be returned here as the user is already authenticated via primary method.
             logger.info(`${functionName} MFA login token verified successfully for user ${userId}.`, logContext);
             return { success: true };
 
