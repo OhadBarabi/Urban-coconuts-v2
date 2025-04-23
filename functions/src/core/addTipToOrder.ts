@@ -8,24 +8,18 @@ import {
     User, Order, OrderStatus, PaymentStatus, PaymentDetails
 } from '../models'; // Adjust path if needed
 
-// --- Assuming helper functions are imported or defined elsewhere ---
-// import { checkPermission } from '../utils/permissions'; // Might not be needed if only owner can tip
-// import { chargePaymentMethod } from '../utils/payment_helpers'; // Payment gateway interaction for tip charge
-// import { logUserActivity } from '../utils/logging';
+// --- Import Helpers ---
+// import { checkPermission } from '../utils/permissions'; // Still using mock below
+import { chargePaymentMethod } from '../utils/payment_helpers'; // <-- Import from new helper
+// import { logUserActivity } from '../utils/logging'; // Still using mock below
+// import { sendPushNotification } from '../utils/notifications'; // Still using mock below
 
 // --- Mocks for required helper functions (Replace with actual implementations) ---
 async function checkPermission(userId: string | null, permissionId: string, context?: any): Promise<boolean> { logger.info(`[Mock Auth] Check ${permissionId} for ${userId}`, context); return userId != null; }
-interface ChargeResult { success: boolean; transactionId?: string; error?: string; }
-async function chargePaymentMethod(customerId: string, amountSmallestUnit: number, currencyCode: string, description: string, paymentMethodToken?: string | null, paymentGatewayCustomerId?: string | null, orderId?: string): Promise<ChargeResult> {
-    logger.info(`[Mock Payment] Charging TIP ${amountSmallestUnit} ${currencyCode} for customer ${customerId}. Order: ${orderId}. Token provided: ${!!paymentMethodToken}`);
-    await new Promise(res => setTimeout(res, 1800)); // Simulate payment processing time
-    if (Math.random() < 0.08) { // Simulate higher failure rate for charge
-        logger.error("[Mock Payment] Tip Charge FAILED.");
-        return { success: false, error: "Mock Tip Charge Declined/Failed" };
-    }
-    return { success: true, transactionId: `TIP_CHG_${Date.now()}` };
-}
+// chargePaymentMethod is now imported from the helper, mock is inside the helper file.
 async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); }
+interface NotificationPayload { userId: string; type: string; titleKey: string; messageKey: string; messageParams?: { [key: string]: any }; payload?: { [key: string]: string }; }
+async function sendPushNotification(notification: NotificationPayload): Promise<void> { logger.info(`[Mock Notification] Sending push notification to ${notification.userId}`, notification); }
 // --- End Mocks ---
 
 // --- Configuration ---
@@ -43,11 +37,13 @@ enum ErrorCode {
     InternalError = "INTERNAL_ERROR",
     // Specific codes
     OrderNotFound = "ORDER_NOT_FOUND",
+    UserNotFound = "USER_NOT_FOUND", // Added for completeness
     NotOrderOwner = "NOT_ORDER_OWNER",
     InvalidOrderStatus = "INVALID_ORDER_STATUS", // Not 'Black' (Completed)
     TipAlreadyAdded = "TIP_ALREADY_ADDED",
     InvalidTipAmount = "INVALID_TIP_AMOUNT",
     PaymentChargeFailed = "PAYMENT_CHARGE_FAILED",
+    PaymentActionRequired = "PAYMENT_ACTION_REQUIRED", // Added in case direct charge needs action
 }
 
 // --- Interfaces ---
@@ -63,10 +59,10 @@ export const addTipToOrder = functions.https.onCall(
         region: FUNCTION_REGION,
         memory: "512MiB", // Allow memory for payment interaction
         timeoutSeconds: 90, // Allow more time for payment processing
-        // secrets: ["PAYMENT_GATEWAY_SECRET"], // If chargePaymentMethod needs secret
+        // secrets: ["PAYMENT_GATEWAY_SECRET"], // Uncomment if payment helper needs secrets
     },
-    async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[addTipToOrder V1]";
+    async (request): Promise<{ success: true; requiresAction?: boolean; actionUrl?: string } | { success: false; error: string; errorCode: string }> => {
+        const functionName = "[addTipToOrder V2 - Refactored]";
         const startTimeFunc = Date.now();
 
         // 1. Authentication & Authorization
@@ -90,7 +86,7 @@ export const addTipToOrder = functions.https.onCall(
         // --- Variables ---
         let orderData: Order;
         let userData: User;
-        let chargeResult: ChargeResult | null = null;
+        let chargeResult: Awaited<ReturnType<typeof chargePaymentMethod>> | null = null; // Use type from helper
 
         try {
             // 3. Fetch User & Order Data Concurrently
@@ -114,6 +110,7 @@ export const addTipToOrder = functions.https.onCall(
             logContext.orderCustomerId = orderData.customerId;
             logContext.paymentStatus = orderData.paymentStatus;
             logContext.currentTip = orderData.tipAmountSmallestUnit;
+            logContext.currencyCode = orderData.currencyCode;
 
             // 4. Ownership Check
             if (orderData.customerId !== customerId) {
@@ -133,78 +130,104 @@ export const addTipToOrder = functions.https.onCall(
                  return { success: false, error: "error.order.tipAlreadyAdded", errorCode: ErrorCode.TipAlreadyAdded };
             }
 
-            // 6. Process Tip Payment (if needed)
-            // We need to charge the tip amount separately.
-            // Assume the original order payment is already settled (Paid/Captured).
+            // 6. Process Tip Payment
             logger.info(`${functionName} Order ${orderId}: Attempting to charge tip amount ${tipAmountSmallestUnit} ${orderData.currencyCode}...`, logContext);
             chargeResult = await chargePaymentMethod(
                 customerId,
                 tipAmountSmallestUnit,
                 orderData.currencyCode,
-                `Tip for Order ${orderId}`,
+                `Tip for Order ${orderId} - Urban Coconuts`,
                 paymentMethodToken, // Use new token if provided, otherwise default/stored method
                 userData.paymentGatewayCustomerId,
                 orderId // Pass orderId for reference in payment gateway
             );
 
-            if (!chargeResult.success || !chargeResult.transactionId) {
-                 logger.error(`${functionName} Order ${orderId}: Tip charge FAILED.`, { ...logContext, error: chargeResult.error });
-                 // Don't update the order if tip charge fails.
-                 throw new HttpsError('aborted', `error.payment.chargeFailed::${chargeResult.error || 'Unknown'}`, { errorCode: ErrorCode.PaymentChargeFailed });
+            if (!chargeResult.success || (!chargeResult.transactionId && !chargeResult.requiresAction)) {
+                 logger.error(`${functionName} Order ${orderId}: Tip charge FAILED.`, { ...logContext, error: chargeResult.errorMessage, code: chargeResult.errorCode });
+                 // Return specific error based on payment failure
+                 if (chargeResult.requiresAction) {
+                      // This case might be less common for tips, but handle it
+                      return { success: false, error: "error.payment.actionRequired", errorCode: ErrorCode.PaymentActionRequired, requiresAction: true, actionUrl: chargeResult.actionUrl };
+                 } else {
+                      return { success: false, error: `error.payment.chargeFailed::${chargeResult.errorCode || 'Unknown'}`, errorCode: ErrorCode.PaymentChargeFailed };
+                 }
             }
-            logger.info(`${functionName} Order ${orderId}: Tip charge successful. TxID: ${chargeResult.transactionId}`, logContext);
+            logger.info(`${functionName} Order ${orderId}: Tip charge initiated. TxID/IntentID: ${chargeResult.transactionId}. Requires Action: ${chargeResult.requiresAction}`, logContext);
 
             // 7. Update Order Document with Tip and New Final Amount
+            // We update the order even if requiresAction is true, but maybe set a specific payment status?
             const newFinalAmount = (orderData.finalAmount ?? 0) + tipAmountSmallestUnit;
             const now = Timestamp.now();
             const serverTimestamp = FieldValue.serverTimestamp();
 
-            // Store tip payment details separately or append to existing paymentDetails?
-            // Let's add a separate field for tip payment details for clarity.
+            // Store tip payment details separately or append? Let's use a dedicated field.
             const tipPaymentDetails: PaymentDetails = {
                  chargeTimestamp: now,
-                 chargeTransactionId: chargeResult.transactionId,
+                 chargeTransactionId: chargeResult.transactionId ?? `ACTION_REQ_${chargeResult.timestamp?.toMillis()}`, // Use placeholder if only action required
                  chargeAmountSmallestUnit: tipAmountSmallestUnit,
-                 chargeSuccess: true,
+                 chargeSuccess: !chargeResult.requiresAction, // Mark as success only if no action needed immediately
                  currencyCode: orderData.currencyCode,
-                 // gatewayName: 'MockGateway' // Add if known
+                 gatewayName: chargeResult.gatewayName,
+                 paymentMethodType: chargeResult.paymentMethodType,
+                 paymentMethodLast4: chargeResult.last4,
+                 requiresAction: chargeResult.requiresAction,
+                 actionUrl: chargeResult.actionUrl,
+                 errorCode: chargeResult.errorCode,
+                 errorMessage: chargeResult.errorMessage,
             };
 
-            logger.info(`${functionName} Updating order ${orderId} with tip amount and new final amount...`, logContext);
+            // Determine the payment status update
+            let updatedPaymentStatus = orderData.paymentStatus; // Keep original status unless tip succeeds without action
+            if (!chargeResult.requiresAction && chargeResult.success) {
+                // If original was 'Paid', it remains 'Paid'. If it was something else (unlikely for completed order), update?
+                // Let's assume the order payment status is already final ('Paid' or 'Captured'). Adding a tip doesn't change that status.
+                // We just record the tip payment separately.
+                 logger.info(`${functionName} Tip charge successful without action. Order payment status remains ${updatedPaymentStatus}.`, logContext);
+            } else if (chargeResult.requiresAction) {
+                 // What should the order payment status be if tip requires action?
+                 // Maybe add a specific status like 'TipActionRequired'? Or just rely on tipPaymentDetails?
+                 // Let's rely on tipPaymentDetails for now.
+                 logger.warn(`${functionName} Tip charge requires further action. Order payment status remains ${updatedPaymentStatus}.`, logContext);
+            }
+
+
+            logger.info(`${functionName} Updating order ${orderId} with tip amount and details...`, logContext);
             await orderRef.update({
                 tipAmountSmallestUnit: tipAmountSmallestUnit,
                 finalAmount: newFinalAmount, // Update final amount to include tip
                 tipPaymentDetails: tipPaymentDetails, // Store tip payment info
+                // paymentStatus: updatedPaymentStatus, // Decide if order payment status needs update
                 updatedAt: serverTimestamp,
-                // Add to status history? Optional.
-                // statusHistory: FieldValue.arrayUnion({ status: orderData.status, timestamp: now, userId: customerId, reason: `Tip added: ${tipAmountSmallestUnit}` })
             });
-            logger.info(`${functionName} Order ${orderId} updated successfully with tip.`);
+            logger.info(`${functionName} Order ${orderId} updated successfully with tip details.`);
 
 
-            // 8. Trigger Notifications (Optional)
-            // Notify Courier about the tip?
-            if (orderData.courierId) {
+            // 8. Trigger Notifications (Optional) - Only if charge succeeded without action?
+            if (!chargeResult.requiresAction && chargeResult.success && orderData.courierId) {
                  sendPushNotification({
                      userId: orderData.courierId, type: "TipReceived",
                      titleKey: "notification.tipReceived.title", messageKey: "notification.tipReceived.message",
-                     messageParams: { customerName: userData.displayName ?? 'Customer', amount: (tipAmountSmallestUnit / 100).toFixed(2), currency: orderData.currencyCode },
+                     messageParams: { /*customerName: userData.displayName ?? 'Customer',*/ amount: (tipAmountSmallestUnit / 100).toFixed(2), currency: orderData.currencyCode }, // Removed name for privacy?
                      payload: { orderId: orderId }
                  }).catch(err => logger.error("Failed sending courier tip notification", { err }));
             }
 
             // 9. Log User Activity (Async)
-            logUserActivity("AddTipToOrder", { orderId, tipAmount: tipAmountSmallestUnit, paymentSuccess: chargeResult.success }, customerId)
+            logUserActivity("AddTipToOrder", { orderId, tipAmount: tipAmountSmallestUnit, paymentSuccess: chargeResult.success, requiresAction: chargeResult.requiresAction }, customerId)
                 .catch(err => logger.error("Failed logging user activity", { err }));
 
-            // 10. Return Success
-            return { success: true };
+            // 10. Return Success (potentially with action required)
+            const successResponse: { success: true; requiresAction?: boolean; actionUrl?: string } = { success: true };
+            if (chargeResult.requiresAction) {
+                successResponse.requiresAction = true;
+                successResponse.actionUrl = chargeResult.actionUrl ?? undefined;
+            }
+            return successResponse;
 
         } catch (error: any) {
             // Error Handling
             logger.error(`${functionName} Execution failed.`, { ...logContext, error: error?.message, details: error?.details });
             const isHttpsError = error instanceof HttpsError;
-            const code = isHttpsError ? error.code : 'UNKNOWN';
             let finalErrorCode: ErrorCode = ErrorCode.InternalError;
             let finalErrorMessageKey: string = "error.internalServer";
 
