@@ -15,6 +15,7 @@
   },
   "main": "lib/index.js",
   "dependencies": {
+    "@google-cloud/kms": "^5.0.1",
     "@types/qrcode": "^1.5.5",
     "@types/speakeasy": "^2.0.10",
     "firebase-admin": "^12.6.0",

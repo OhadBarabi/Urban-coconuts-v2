@@ -1,44 +1,58 @@
 /**
  * encryption.ts
  *
- * Helper module for handling encryption and decryption tasks.
- * Currently focuses on MFA secrets.
+ * Helper module for handling encryption and decryption tasks using Google Cloud KMS.
+ * Focuses on MFA secrets.
  *
- * CRITICAL SECURITY WARNING:
- * ==========================
- * The current implementations for encryptMfaSecret and decryptMfaSecret
- * are **MOCKS** and are **NOT SECURE**. They use simple Base64 encoding
- * which provides NO actual encryption.
- *
- * These functions MUST be replaced with a robust and secure encryption
- * mechanism before deploying to any real environment. Recommended options:
- * 1. Google Cloud Key Management Service (KMS): Recommended for GCP/Firebase environments.
- * - Requires setting up KMS keys and permissions.
- * - Use the official Google Cloud client libraries for Node.js (@google-cloud/kms).
- * 2. Strong Cryptographic Library (e.g., Node.js 'crypto'):
- * - Use standard algorithms like AES-256-GCM.
- * - Requires secure key management (e.g., storing keys in Secret Manager).
- * - Ensure proper handling of Initialization Vectors (IVs) and authentication tags.
- *
- * DO NOT USE THE CURRENT MOCKS IN PRODUCTION OR STAGING ENVIRONMENTS.
+ * Prerequisites:
+ * 1. Enable Cloud KMS API in your Google Cloud project.
+ * 2. Create a Key Ring in KMS (e.g., 'Urban-coconuts-keys').
+ * 3. Create a CryptoKey within the Key Ring with purpose 'Symmetric encrypt/decrypt' (e.g., 'mfa-secret-key').
+ * 4. Grant the Cloud Functions service account (e.g., 'urbancoconuts-v2@appspot.gserviceaccount.com')
+ * the 'Cloud KMS CryptoKey Encrypter/Decrypter' role on the created CryptoKey or Key Ring.
+ * 5. Install the KMS client library: `npm install @google-cloud/kms`
+ * 6. Ensure KMS configuration below matches your setup or use environment variables.
  */
 
+import * as functions from "firebase-functions/v2"; // Needed for logger if used outside functions
 import * as logger from "firebase-functions/logger";
-// import * as kms from '@google-cloud/kms'; // Example: For Cloud KMS
-// import * as crypto from 'crypto'; // Example: For Node.js crypto
+import { KeyManagementServiceClient } from '@google-cloud/kms'; // Import KMS client
 
-// --- Configuration (Placeholder - replace with actual KMS/Secret Manager config) ---
-// const KMS_KEY_RING_ID = 'your-key-ring-id';
-// const KMS_CRYPTO_KEY_ID = 'your-mfa-crypto-key-id';
-// const KMS_LOCATION_ID = 'global'; // Or your specific location
-// const KMS_PROJECT_ID = process.env.GCLOUD_PROJECT; // Get project ID from environment
+// --- Configuration ---
+// Uses details provided by the user, but ideally use environment variables for deployment.
+// Example using environment variables (set these in your Cloud Functions deployment)
+const KMS_PROJECT_ID = process.env.GCLOUD_PROJECT || 'urbancoconuts-v2'; // Default to GCP project if available
+const KMS_LOCATION_ID = process.env.KMS_LOCATION_ID || 'global'; // User specified 'global'
+const KMS_KEY_RING_ID = process.env.KMS_KEY_RING_ID || 'Urban-coconuts-keys'; // User specified 'Urban-coconuts-keys'
+const KMS_CRYPTO_KEY_ID = process.env.KMS_CRYPTO_KEY_ID || 'mfa-secret-key'; // User specified 'mfa-secret-key'
 
-// Example: Initialize KMS client (uncomment and configure when implementing)
-// const kmsClient = new kms.KeyManagementServiceClient();
-// const keyName = kmsClient.cryptoKeyPath(KMS_PROJECT_ID!, KMS_LOCATION_ID, KMS_KEY_RING_ID, KMS_CRYPTO_KEY_ID);
+// --- Initialize KMS Client ---
+let kmsClient: KeyManagementServiceClient | null = null;
+let keyName = '';
+
+try {
+    // Validate configuration before initializing client
+    if (!KMS_PROJECT_ID || !KMS_LOCATION_ID || !KMS_KEY_RING_ID || !KMS_CRYPTO_KEY_ID) {
+        logger.error("KMS Configuration is incomplete. Check environment variables or constants in encryption.ts.");
+        // Optionally throw an error to prevent function deployment/initialization if config is missing
+        // throw new Error("KMS Configuration incomplete.");
+    } else {
+        kmsClient = new KeyManagementServiceClient();
+        keyName = kmsClient.cryptoKeyPath(
+            KMS_PROJECT_ID,
+            KMS_LOCATION_ID,
+            KMS_KEY_RING_ID,
+            KMS_CRYPTO_KEY_ID
+        );
+        logger.info(`KMS Client initialized for key: ${keyName}`);
+    }
+} catch (error: any) {
+    logger.error("Failed to initialize KMS Client.", { error: error.message, keyName });
+    kmsClient = null; // Ensure client is null if initialization fails
+}
+
 
 // --- Interfaces ---
-
 interface EncryptionResult {
     success: boolean;
     encryptedData?: string; // Base64 encoded encrypted data
@@ -55,106 +69,110 @@ interface DecryptionResult {
 // === Encrypt MFA Secret =====================================================
 // ============================================================================
 /**
- * Encrypts the provided MFA secret.
- *
- * CRITICAL: CURRENTLY A NON-SECURE MOCK (Base64 encoding). Replace with real encryption.
+ * Encrypts the provided MFA secret using Google Cloud KMS.
  *
  * @param plaintextSecret - The plaintext MFA secret (usually base32 encoded).
- * @param userId - The user ID associated with the secret (can be used as Additional Authenticated Data (AAD) in KMS/AES-GCM).
+ * @param userId - The user ID associated with the secret (used as Additional Authenticated Data (AAD)).
  * @returns Promise<EncryptionResult>
  */
 export async function encryptMfaSecret(plaintextSecret: string, userId: string): Promise<EncryptionResult> {
-    const operation = "encryptMfaSecret";
+    const operation = "encryptMfaSecret (KMS)";
     logger.info(`[${operation}] Called for user ${userId}. Length: ${plaintextSecret.length}`);
 
-    // --- MOCK IMPLEMENTATION (Base64 - NOT SECURE!) ---
-    try {
-        logger.warn(`[${operation}] SECURITY WARNING: Using insecure Base64 mock for encryption!`);
-        const encryptedData = Buffer.from(plaintextSecret).toString('base64');
-        // Simulate slight delay
-        await new Promise(res => setTimeout(res, 50));
-        return { success: true, encryptedData };
-    } catch (error: any) {
-        logger.error(`[${operation}] Mock Base64 encoding failed.`, { error: error.message, userId });
-        return { success: false, error: "Mock encryption failed." };
+    if (!kmsClient || !keyName) {
+        logger.error(`[${operation}] KMS client not initialized or keyName is invalid. Check configuration and initialization logs.`);
+        return { success: false, error: "KMS client not initialized." };
     }
-    // --- END MOCK ---
+    if (!plaintextSecret) {
+        logger.error(`[${operation}] Plaintext secret is empty or null for user ${userId}.`);
+        return { success: false, error: "Plaintext secret cannot be empty." };
+    }
+     if (!userId) {
+         logger.error(`[${operation}] User ID (AAD) is empty or null.`);
+         return { success: false, error: "User ID (AAD) cannot be empty." };
+     }
 
-    /*
-    // --- EXAMPLE REAL IMPLEMENTATION (Conceptual - Cloud KMS) ---
+
     try {
-        // const [result] = await kmsClient.encrypt({
-        //     name: keyName,
-        //     plaintext: Buffer.from(plaintextSecret),
-        //     additionalAuthenticatedData: Buffer.from(userId), // Use userId as AAD
-        // });
-        // if (!result.ciphertext) {
-        //     throw new Error("KMS encryption returned no ciphertext.");
-        // }
-        // const encryptedData = Buffer.from(result.ciphertext).toString('base64');
-        // return { success: true, encryptedData };
+        const [result] = await kmsClient.encrypt({
+            name: keyName,
+            plaintext: Buffer.from(plaintextSecret, 'utf-8'), // Ensure consistent encoding
+            // Use userId as Additional Authenticated Data (AAD) for context binding.
+            // This ensures the ciphertext can only be decrypted with the same userId.
+            additionalAuthenticatedData: Buffer.from(userId, 'utf-8'),
+        });
+
+        if (!result.ciphertext) {
+            // This case should ideally not happen if the API call succeeds without error
+            logger.error(`[${operation}] KMS encryption returned no ciphertext for user ${userId}.`);
+            throw new Error("KMS encryption returned no ciphertext.");
+        }
+
+        // The ciphertext is returned as a Buffer. Encode it to Base64 for storage.
+        const encryptedData = Buffer.from(result.ciphertext).toString('base64');
+        logger.info(`[${operation}] Secret encrypted successfully for user ${userId}.`);
+        return { success: true, encryptedData };
+
     } catch (error: any) {
-        logger.error(`[${operation}] Cloud KMS encryption failed for user ${userId}.`, { error: error.message });
+        logger.error(`[${operation}] Cloud KMS encryption failed for user ${userId}. Check KMS key permissions for service account.`, { error: error.message, code: error.code, keyName });
+        // Avoid leaking detailed KMS errors to the client if possible
         return { success: false, error: "KMS encryption failed." };
     }
-    // --- END REAL IMPLEMENTATION EXAMPLE ---
-    */
 }
 
 // ============================================================================
 // === Decrypt MFA Secret =====================================================
 // ============================================================================
 /**
- * Decrypts the provided encrypted MFA secret.
- *
- * CRITICAL: CURRENTLY A NON-SECURE MOCK (Base64 decoding). Replace with real decryption.
+ * Decrypts the provided encrypted MFA secret using Google Cloud KMS.
  *
  * @param encryptedSecretBase64 - The Base64 encoded encrypted MFA secret stored in Firestore.
  * @param userId - The user ID associated with the secret (must match the AAD used during encryption).
  * @returns Promise<DecryptionResult>
  */
 export async function decryptMfaSecret(encryptedSecretBase64: string, userId: string): Promise<DecryptionResult> {
-    const operation = "decryptMfaSecret";
+    const operation = "decryptMfaSecret (KMS)";
     logger.info(`[${operation}] Called for user ${userId}.`);
 
-    // --- MOCK IMPLEMENTATION (Base64 - NOT SECURE!) ---
-    try {
-        logger.warn(`[${operation}] SECURITY WARNING: Using insecure Base64 mock for decryption!`);
-        const decryptedData = Buffer.from(encryptedSecretBase64, 'base64').toString('utf-8');
-        // Simulate slight delay
-        await new Promise(res => setTimeout(res, 50));
-        if (!decryptedData) {
-             throw new Error("Mock Base64 decoding resulted in empty string.");
-        }
-        return { success: true, decryptedData };
-    } catch (error: any) {
-        logger.error(`[${operation}] Mock Base64 decoding failed.`, { error: error.message, userId });
-        // Don't reveal too much info in the error message potentially
-        return { success: false, error: "Mock decryption failed or invalid data." };
-    }
-    // --- END MOCK ---
+     if (!kmsClient || !keyName) {
+         logger.error(`[${operation}] KMS client not initialized or keyName is invalid. Check configuration and initialization logs.`);
+         return { success: false, error: "KMS client not initialized." };
+     }
+     if (!encryptedSecretBase64) {
+         logger.error(`[${operation}] Encrypted secret is empty or null for user ${userId}.`);
+         return { success: false, error: "Encrypted secret cannot be empty." };
+     }
+      if (!userId) {
+          logger.error(`[${operation}] User ID (AAD) is empty or null.`);
+          return { success: false, error: "User ID (AAD) cannot be empty." };
+      }
 
-    /*
-    // --- EXAMPLE REAL IMPLEMENTATION (Conceptual - Cloud KMS) ---
     try {
-        // const [result] = await kmsClient.decrypt({
-        //     name: keyName,
-        //     ciphertext: Buffer.from(encryptedSecretBase64, 'base64'),
-        //     additionalAuthenticatedData: Buffer.from(userId), // Must match AAD used during encryption
-        // });
-        // if (!result.plaintext) {
-        //     throw new Error("KMS decryption returned no plaintext.");
-        // }
-        // const decryptedData = Buffer.from(result.plaintext).toString('utf-8');
-        // return { success: true, decryptedData };
+        const [result] = await kmsClient.decrypt({
+            name: keyName,
+            ciphertext: Buffer.from(encryptedSecretBase64, 'base64'),
+            // Provide the *exact same* AAD (userId) used during encryption.
+            // If this doesn't match, KMS will return an error.
+            additionalAuthenticatedData: Buffer.from(userId, 'utf-8'),
+        });
+
+        if (!result.plaintext) {
+            // This might happen if decryption fails validation (e.g., AAD mismatch)
+            logger.error(`[${operation}] KMS decryption returned no plaintext for user ${userId}. Possible AAD mismatch or corrupted data?`);
+            throw new Error("KMS decryption returned no plaintext.");
+        }
+
+        // Convert the plaintext Buffer back to a string.
+        const decryptedData = Buffer.from(result.plaintext).toString('utf-8');
+        logger.info(`[${operation}] Secret decrypted successfully for user ${userId}.`);
+        return { success: true, decryptedData };
+
     } catch (error: any) {
         // Handle potential errors like invalid ciphertext, AAD mismatch, permission issues
-        logger.error(`[${operation}] Cloud KMS decryption failed for user ${userId}.`, { error: error.message });
+        logger.error(`[${operation}] Cloud KMS decryption failed for user ${userId}. Check KMS key permissions and AAD.`, { error: error.message, code: error.code, keyName });
         // Avoid leaking detailed error messages that could help attackers
         return { success: false, error: "KMS decryption failed or invalid secret." };
     }
-    // --- END REAL IMPLEMENTATION EXAMPLE ---
-    */
 }
 
-// Add other encryption/decryption functions as needed (e.g., for other sensitive data)
+// Add other encryption/decryption functions as needed
