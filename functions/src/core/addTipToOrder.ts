@@ -9,15 +9,14 @@ import {
 } from '../models'; // Adjust path if needed
 
 // --- Import Helpers ---
-import { checkPermission } from '../utils/permissions'; // <-- Import REAL helper
+import { checkPermission } from '../utils/permissions';
 import { chargePaymentMethod } from '../utils/payment_helpers';
+import { sendPushNotification } from '../utils/notifications'; // <-- Import REAL helper
 // import { logUserActivity } from '../utils/logging'; // Still using mock below
-// import { sendPushNotification } from '../utils/notifications'; // Still using mock below
 
 // --- Mocks for other required helper functions (Replace with actual implementations) ---
 async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); }
-interface NotificationPayload { userId: string; type: string; titleKey: string; messageKey: string; messageParams?: { [key: string]: any }; payload?: { [key: string]: string }; }
-async function sendPushNotification(notification: NotificationPayload): Promise<void> { logger.info(`[Mock Notification] Sending push notification to ${notification.userId}`, notification); }
+// sendPushNotification is now imported from the helper
 // --- End Mocks ---
 
 // --- Configuration ---
@@ -60,12 +59,12 @@ export const addTipToOrder = functions.https.onCall(
         // secrets: ["PAYMENT_GATEWAY_SECRET"], // Uncomment if payment helper needs secrets
     },
     async (request): Promise<{ success: true; requiresAction?: boolean; actionUrl?: string } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[addTipToOrder V3 - Permissions]"; // Updated version name
+        const functionName = "[addTipToOrder V4 - Notifications]"; // Updated version name
         const startTimeFunc = Date.now();
 
         // 1. Authentication & Authorization
         if (!request.auth?.uid) { return { success: false, error: "error.auth.unauthenticated", errorCode: ErrorCode.Unauthenticated }; }
-        const customerId = request.auth.uid; // Customer adding tip to their own order
+        const customerId = request.auth.uid;
         const data = request.data as AddTipToOrderInput;
         const logContext: any = { customerId, orderId: data?.orderId, tipAmount: data?.tipAmountSmallestUnit };
 
@@ -90,15 +89,12 @@ export const addTipToOrder = functions.https.onCall(
             // 3. Fetch User & Order Data Concurrently
             const userRef = db.collection('users').doc(customerId);
             const orderRef = db.collection('orders').doc(orderId);
-
             const [userSnap, orderSnap] = await Promise.all([userRef.get(), orderRef.get()]);
 
-            // Validate User
             if (!userSnap.exists) throw new HttpsError('not-found', `error.user.notFound::${customerId}`, { errorCode: ErrorCode.UserNotFound });
             userData = userSnap.data() as User;
             if (!userData.isActive) throw new HttpsError('permission-denied', "error.user.inactive", { errorCode: ErrorCode.PermissionDenied });
 
-            // Validate Order Exists
             if (!orderSnap.exists) {
                 logger.warn(`${functionName} Order ${orderId} not found.`, logContext);
                 return { success: false, error: "error.order.notFound", errorCode: ErrorCode.OrderNotFound };
@@ -110,17 +106,13 @@ export const addTipToOrder = functions.https.onCall(
             logContext.currentTip = orderData.tipAmountSmallestUnit;
             logContext.currencyCode = orderData.currencyCode;
 
-            // 4. Ownership Check (Could use checkPermission if a specific permission exists)
-            // For now, direct comparison is fine as only the owner should add tips.
+            // 4. Ownership Check
             if (orderData.customerId !== customerId) {
-                // Optional: Use checkPermission if we define 'order:addTip:own'
-                // const hasPermission = await checkPermission(customerId, userData.role, 'order:addTip:own', logContext);
-                // if (!hasPermission) { ... }
                 logger.error(`${functionName} User ${customerId} attempted to add tip to order ${orderId} owned by ${orderData.customerId}.`, logContext);
                 return { success: false, error: "error.permissionDenied.notOrderOwner", errorCode: ErrorCode.NotOrderOwner };
             }
 
-            // 5. State Validation - Logic remains the same as V2
+            // 5. State Validation
             if (orderData.status !== OrderStatus.Black) {
                  logger.warn(`${functionName} Cannot add tip to order ${orderId} because its status is '${orderData.status}'.`, logContext);
                  return { success: false, error: `error.order.invalidStatus.addTip::${orderData.status}`, errorCode: ErrorCode.InvalidOrderStatus };
@@ -130,7 +122,7 @@ export const addTipToOrder = functions.https.onCall(
                  return { success: false, error: "error.order.tipAlreadyAdded", errorCode: ErrorCode.TipAlreadyAdded };
             }
 
-            // 6. Process Tip Payment - Logic remains the same as V2
+            // 6. Process Tip Payment
             logger.info(`${functionName} Order ${orderId}: Attempting to charge tip amount ${tipAmountSmallestUnit} ${orderData.currencyCode}...`, logContext);
             chargeResult = await chargePaymentMethod(
                 customerId, tipAmountSmallestUnit, orderData.currencyCode,
@@ -148,7 +140,7 @@ export const addTipToOrder = functions.https.onCall(
             }
             logger.info(`${functionName} Order ${orderId}: Tip charge initiated. TxID/IntentID: ${chargeResult.transactionId}. Requires Action: ${chargeResult.requiresAction}`, logContext);
 
-            // 7. Update Order Document with Tip and New Final Amount - Logic remains the same as V2
+            // 7. Update Order Document with Tip and New Final Amount
             const newFinalAmount = (orderData.finalAmount ?? 0) + tipAmountSmallestUnit;
             const now = Timestamp.now();
             const serverTimestamp = FieldValue.serverTimestamp();
@@ -176,21 +168,32 @@ export const addTipToOrder = functions.https.onCall(
             });
             logger.info(`${functionName} Order ${orderId} updated successfully with tip details.`);
 
-            // 8. Trigger Notifications (Optional) - Logic remains the same as V2
+            // 8. Trigger Notifications (Using REAL Helper - currently Mock)
             if (!chargeResult.requiresAction && chargeResult.success && orderData.courierId) {
+                 // Call the imported helper function
                  sendPushNotification({
-                     userId: orderData.courierId, type: "TipReceived",
-                     titleKey: "notification.tipReceived.title", messageKey: "notification.tipReceived.message",
-                     messageParams: { amount: (tipAmountSmallestUnit / 100).toFixed(2), currency: orderData.currencyCode },
-                     payload: { orderId: orderId }
+                     userId: orderData.courierId, // Target the courier
+                     type: "TipReceived",
+                     titleKey: "notification.tipReceived.title", // i18n keys for client app
+                     messageKey: "notification.tipReceived.message",
+                     messageParams: { // Parameters for localization
+                         // Consider privacy: maybe don't send customer name?
+                         // customerName: userData.displayName ?? 'Customer',
+                         amount: (tipAmountSmallestUnit / 100).toFixed(2), // Format amount
+                         currency: orderData.currencyCode
+                     },
+                     payload: { // Optional data for client app navigation
+                         orderId: orderId,
+                         screen: 'orderDetails' // Example screen hint
+                     }
                  }).catch(err => logger.error("Failed sending courier tip notification", { err }));
             }
 
-            // 9. Log User Activity (Async) - Logic remains the same as V2
+            // 9. Log User Activity (Async)
             logUserActivity("AddTipToOrder", { orderId, tipAmount: tipAmountSmallestUnit, paymentSuccess: chargeResult.success, requiresAction: chargeResult.requiresAction }, customerId)
                 .catch(err => logger.error("Failed logging user activity", { err }));
 
-            // 10. Return Success (potentially with action required) - Logic remains the same as V2
+            // 10. Return Success (potentially with action required)
             const successResponse: { success: true; requiresAction?: boolean; actionUrl?: string } = { success: true };
             if (chargeResult.requiresAction) {
                 successResponse.requiresAction = true;
@@ -199,7 +202,7 @@ export const addTipToOrder = functions.https.onCall(
             return successResponse;
 
         } catch (error: any) {
-            // Error Handling - Logic remains the same as V2
+            // Error Handling
             logger.error(`${functionName} Execution failed.`, { ...logContext, error: error?.message, details: error?.details });
             const isHttpsError = error instanceof HttpsError;
             let finalErrorCode: ErrorCode = ErrorCode.InternalError;
