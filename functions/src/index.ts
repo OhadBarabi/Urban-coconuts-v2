@@ -48,7 +48,8 @@ import { createPromoCode, updatePromoCode, deletePromoCode, listPromoCodes } fro
 
 // --- Import Scheduled Functions ---
 import { autoCancelExpiredOrders, deactivateExpiredPromotions, cleanupOldLogs } from './scheduled/scheduledFunctions'; // Background
-import { calculateVipTiers } from './scheduled/calculateVipTiers'; // <-- שורה חדשה
+import { calculateVipTiers } from './scheduled/calculateVipTiers';
+import { generateDailySalesReport } from './scheduled/generateDailySalesReport'; // <-- שורה חדשה
 
 // --- Import Auth Functions ---
 import { sendOtp } from './auth/sendOtp';
@@ -115,7 +116,8 @@ autoCancelExpiredOrders;
 deactivateExpiredPromotions;
 cleanupOldLogs;
 handleOrderCancellationSideEffects;
-calculateVipTiers; // <-- שורה חדשה
+calculateVipTiers;
+generateDailySalesReport; // <-- שורה חדשה
 // Note: Utility functions like logUserActivity don't need to be referenced here
 // as they are imported and used by other functions.
 // ... add references for other background/triggered functions ...
