@@ -4,21 +4,20 @@ import * as admin from "firebase-admin";
 import { HttpsError } from "firebase-functions/v2/https";
 
 // --- Import Models ---
-import { User, PermissionDoc, RoleDoc } from '../models'; // Adjust path if needed
+import { User, Permission } from '../models'; // Adjust path if needed
 
-// --- Assuming helper functions are imported or defined elsewhere ---
-// import { checkPermission } from '../utils/permissions';
-// import { logAdminAction } from '../utils/logging';
+// --- Import Helpers ---
+import { checkPermission } from '../utils/permissions'; // <-- Import REAL helper
+// import { logAdminAction } from '../utils/logging'; // Using mock below
 
-// --- Mocks for required helper functions (Replace with actual implementations) ---
-async function checkPermission(userId: string | null, userRole: string | null, permissionId: string, context?: any): Promise<boolean> { logger.info(`[Mock Auth] Check ${permissionId} for ${userId} (${userRole})`, context); return userId != null && (userRole === 'Admin' || userRole === 'SuperAdmin'); }
+// --- Mocks for other required helper functions (Replace with actual implementations) ---
 async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); }
 // --- End Mocks ---
 
 // --- Configuration ---
 // Ensure Firebase Admin is initialized (moved to index.ts)
 const db = admin.firestore();
-const auth = admin.auth(); // For setting custom claims
+const { FieldValue } = admin.firestore;
 const FUNCTION_REGION = "me-west1"; // <<<--- CHANGE TO YOUR REGION
 
 // --- Enums ---
@@ -27,23 +26,19 @@ enum ErrorCode {
     NotFound = "NOT_FOUND", // User, Role, or Permission not found
     InternalError = "INTERNAL_ERROR",
     // Specific codes
-    UserNotFound = "USER_NOT_FOUND",
-    RoleNotFound = "ROLE_NOT_FOUND",
-    FirebaseAuthError = "FIREBASE_AUTH_ERROR",
+    UserNotFound = "USER_NOT_FOUND", // Target user or Admin user not found
+    RoleNotFound = "ROLE_NOT_FOUND", // Role to assign not found
 }
 
 // --- Interfaces ---
 interface ListPermissionsInput {
-    // Optional pagination/filtering parameters
     pageSize?: number;
-    pageToken?: string;
-    category?: string; // Filter by category
+    pageToken?: string; // Use permissionId as page token
+    category?: string | null; // Optional filter by category
 }
 
-interface PermissionOutput {
-    permissionId: string;
-    description?: string | null;
-    category?: string | null;
+interface PermissionOutput extends Permission {
+    permissionId: string; // Add the document ID
 }
 
 interface ListPermissionsOutput {
@@ -52,10 +47,9 @@ interface ListPermissionsOutput {
 }
 
 interface AssignRoleToUserInput {
-    userId: string; // UID of the target user
+    userId: string; // ID of the user to assign the role to
     roleId: string; // ID of the role to assign
 }
-
 
 // ============================================================================
 // === List Permissions Function ==============================================
@@ -63,41 +57,55 @@ interface AssignRoleToUserInput {
 export const listPermissions = functions.https.onCall(
     { region: FUNCTION_REGION, memory: "128MiB" },
     async (request): Promise<{ success: true; data: ListPermissionsOutput } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[listPermissions V1]";
+        const functionName = "[listPermissions V2 - Permissions]"; // Updated version name
         const startTimeFunc = Date.now();
 
-        // 1. Auth & Permissions
+        // 1. Authentication & Authorization
         if (!request.auth?.uid) { return { success: false, error: "error.auth.unauthenticated", errorCode: ErrorCode.Unauthenticated }; }
         const adminUserId = request.auth.uid;
         const data = request.data as ListPermissionsInput; // Input might be empty
         const logContext: any = { adminUserId, pageSize: data?.pageSize, pageToken: data?.pageToken, category: data?.category };
+
         logger.info(`${functionName} Invoked.`, logContext);
 
+        // Fetch admin user role for permission check
         let adminUserRole: string | null = null;
         try {
-            const userSnap = await db.collection('users').doc(adminUserId).get();
-            if (userSnap.exists) adminUserRole = (userSnap.data() as User)?.role;
-            // Allow any authenticated user to list permissions? Or restrict to admin? Let's restrict.
-            const hasPermission = await checkPermission(adminUserId, adminUserRole, 'rbac:permission:list');
-            if (!hasPermission) { return { success: false, error: "error.permissionDenied.listPermissions", errorCode: ErrorCode.PermissionDenied }; }
-        } catch (e: any) { logger.error("Auth/Permission check failed", e); return { success: false, error: "error.internalServer", errorCode: ErrorCode.InternalError }; }
+            const adminUserSnap = await db.collection('users').doc(adminUserId).get();
+            if (!adminUserSnap.exists) throw new HttpsError('not-found', `Admin user ${adminUserId} not found.`, { errorCode: ErrorCode.UserNotFound });
+            adminUserRole = (adminUserSnap.data() as User)?.role;
+            logContext.adminUserRole = adminUserRole;
+
+            // Permission Check (Using REAL helper) - Define permission: 'admin:permission:list'
+            const hasPermission = await checkPermission(adminUserId, adminUserRole, 'admin:permission:list', logContext);
+            if (!hasPermission) {
+                logger.warn(`${functionName} Permission denied for admin ${adminUserId} (Role: ${adminUserRole}) to list permissions.`, logContext);
+                return { success: false, error: "error.permissionDenied.listPermissions", errorCode: ErrorCode.PermissionDenied };
+            }
+        } catch (e: any) {
+             logger.error("Auth/Permission check failed", { ...logContext, error: e.message });
+             const code = e instanceof HttpsError ? e.details?.errorCode : ErrorCode.InternalError;
+             const msg = e instanceof HttpsError ? e.message : "error.internalServer";
+             return { success: false, error: msg, errorCode: code || ErrorCode.InternalError };
+        }
 
         // 2. Prepare Query
-        const pageSize = (typeof data?.pageSize === 'number' && data.pageSize > 0 && data.pageSize <= 100) ? data.pageSize : 50; // Default 50
+        const pageSize = (typeof data?.pageSize === 'number' && data.pageSize > 0 && data.pageSize <= 100) ? data.pageSize : 50; // Default 50?
         let query: admin.firestore.Query<admin.firestore.DocumentData> = db.collection('permissions');
 
         // Add category filter if provided
         if (data?.category && typeof data.category === 'string') {
             query = query.where('category', '==', data.category);
+            logContext.filterCategory = data.category;
         }
 
-        // Add ordering and pagination
+        // Add ordering and pagination (using permissionId / document ID for pagination token)
         query = query.orderBy(admin.firestore.FieldPath.documentId()).limit(pageSize);
         if (data?.pageToken && typeof data.pageToken === 'string') {
             try {
                 query = query.startAfter(data.pageToken);
             } catch (e) {
-                logger.warn("Invalid page token provided", { pageToken: data.pageToken });
+                logger.warn("Invalid page token provided or query failed.", { pageToken: data.pageToken, error: e });
             }
         }
 
@@ -106,18 +114,19 @@ export const listPermissions = functions.https.onCall(
             const snapshot = await query.get();
             const permissions: PermissionOutput[] = [];
             snapshot.forEach(doc => {
-                const data = doc.data() as PermissionDoc;
-                permissions.push({
-                    permissionId: doc.id,
+                const data = doc.data() as Permission;
+                const outputData: PermissionOutput = {
+                    permissionId: doc.id, // Add the document ID
                     description: data.description,
                     category: data.category,
-                });
+                };
+                permissions.push(outputData);
             });
 
             // Determine next page token
             let nextPageToken: string | null = null;
             if (snapshot.docs.length === pageSize) {
-                nextPageToken = snapshot.docs[snapshot.docs.length - 1].id;
+                nextPageToken = snapshot.docs[snapshot.docs.length - 1].id; // Use permissionId (doc ID) as token
             }
 
             logger.info(`${functionName} Found ${permissions.length} permissions. Next page token: ${nextPageToken}`, logContext);
@@ -136,107 +145,98 @@ export const listPermissions = functions.https.onCall(
 
 
 // ============================================================================
-// === Assign Role To User Function ===========================================
+// === Assign Role to User Function ===========================================
 // ============================================================================
 export const assignRoleToUser = functions.https.onCall(
-    { region: FUNCTION_REGION, memory: "256MiB" }, // Slightly more memory for multiple reads/writes
+    { region: FUNCTION_REGION, memory: "128MiB" },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[assignRoleToUser V1]";
+        const functionName = "[assignRoleToUser V2 - Permissions]"; // Updated version name
         const startTimeFunc = Date.now();
 
-        // 1. Auth & Permissions
+        // 1. Authentication & Authorization
         if (!request.auth?.uid) { return { success: false, error: "error.auth.unauthenticated", errorCode: ErrorCode.Unauthenticated }; }
         const adminUserId = request.auth.uid;
         const data = request.data as AssignRoleToUserInput;
-        const logContext: any = { adminUserId, targetUserId: data?.userId, roleId: data?.roleId };
+        const logContext: any = { adminUserId, targetUserId: data?.userId, targetRoleId: data?.roleId };
+
         logger.info(`${functionName} Invoked.`, logContext);
 
+        // Fetch admin user role for permission check
         let adminUserRole: string | null = null;
         try {
-            const userSnap = await db.collection('users').doc(adminUserId).get();
-            if (userSnap.exists) adminUserRole = (userSnap.data() as User)?.role;
-            const hasPermission = await checkPermission(adminUserId, adminUserRole, 'rbac:user:assign_role');
-            if (!hasPermission) { return { success: false, error: "error.permissionDenied.assignRole", errorCode: ErrorCode.PermissionDenied }; }
-        } catch (e: any) { logger.error("Auth/Permission check failed", e); return { success: false, error: "error.internalServer", errorCode: ErrorCode.InternalError }; }
+            const adminUserSnap = await db.collection('users').doc(adminUserId).get();
+            if (!adminUserSnap.exists) throw new HttpsError('not-found', `Admin user ${adminUserId} not found.`, { errorCode: ErrorCode.UserNotFound });
+            adminUserRole = (adminUserSnap.data() as User)?.role;
+            logContext.adminUserRole = adminUserRole;
+
+            // Permission Check (Using REAL helper) - Define permission: 'admin:user:assignRole'
+            const hasPermission = await checkPermission(adminUserId, adminUserRole, 'admin:user:assignRole', logContext);
+            if (!hasPermission) {
+                logger.warn(`${functionName} Permission denied for admin ${adminUserId} (Role: ${adminUserRole}) to assign role.`, logContext);
+                return { success: false, error: "error.permissionDenied.assignRole", errorCode: ErrorCode.PermissionDenied };
+            }
+        } catch (e: any) {
+             logger.error("Auth/Permission check failed", { ...logContext, error: e.message });
+             const code = e instanceof HttpsError ? e.details?.errorCode : ErrorCode.InternalError;
+             const msg = e instanceof HttpsError ? e.message : "error.internalServer";
+             return { success: false, error: msg, errorCode: code || ErrorCode.InternalError };
+        }
 
         // 2. Input Validation
         if (!data?.userId || typeof data.userId !== 'string' ||
-            !data.roleId || typeof data.roleId !== 'string')
+            !data?.roleId || typeof data.roleId !== 'string')
         {
-            logger.error(`${functionName} Invalid input: Missing userId or roleId.`, logContext);
+            logger.error(`${functionName} Invalid input data structure or types.`, { ...logContext, data: JSON.stringify(data).substring(0,500) });
             return { success: false, error: "error.invalidInput.userIdOrRoleId", errorCode: ErrorCode.InvalidArgument };
         }
-        const { userId: targetUserId, roleId } = data;
+        const { userId: targetUserId, roleId: targetRoleId } = data;
 
-        // 3. Fetch Target User & Role (Concurrent)
+        // 3. Validate Target User and Role Existence Concurrently
         const targetUserRef = db.collection('users').doc(targetUserId);
-        const roleRef = db.collection('roles').doc(roleId);
+        const targetRoleRef = db.collection('roles').doc(targetRoleId);
 
         try {
-            const [targetUserSnap, roleSnap] = await Promise.all([targetUserRef.get(), roleRef.get()]);
+            const [targetUserSnap, targetRoleSnap] = await Promise.all([
+                targetUserRef.get(),
+                targetRoleRef.get()
+            ]);
 
-            // Validate Target User
             if (!targetUserSnap.exists) {
-                logger.warn(`${functionName} Target user '${targetUserId}' not found.`, logContext);
-                return { success: false, error: "error.user.notFound", errorCode: ErrorCode.UserNotFound };
+                logger.warn(`${functionName} Target user ${targetUserId} not found.`, logContext);
+                return { success: false, error: "error.assignRole.userNotFound", errorCode: ErrorCode.UserNotFound };
             }
-            const targetUserData = targetUserSnap.data() as User;
-            logContext.targetUserCurrentRole = targetUserData.role;
-
-            // Validate Role
-            if (!roleSnap.exists) {
-                logger.warn(`${functionName} Role '${roleId}' not found.`, logContext);
-                return { success: false, error: "error.role.notFound", errorCode: ErrorCode.RoleNotFound };
+            if (!targetRoleSnap.exists) {
+                logger.warn(`${functionName} Target role ${targetRoleId} not found.`, logContext);
+                return { success: false, error: "error.assignRole.roleNotFound", errorCode: ErrorCode.RoleNotFound };
             }
-            // const roleData = roleSnap.data() as RoleDoc; // Not strictly needed here
+            // Optional: Check if target user is active?
+            // const targetUserData = targetUserSnap.data() as User;
+            // if (!targetUserData.isActive) { ... }
 
-             // Prevent self-assignment change? Or assigning higher roles? Add checks if needed.
-
-             // Idempotency: Check if user already has this role
-             if (targetUserData.role === roleId) {
-                 logger.info(`${functionName} User '${targetUserId}' already has role '${roleId}'. No update needed.`, logContext);
-                 return { success: true };
-             }
-
-            // 4. Update Firestore User Document
-            logger.info(`${functionName} Updating Firestore role for user '${targetUserId}' to '${roleId}'.`, logContext);
+            // 4. Update Target User Document
+            logger.info(`${functionName} Assigning role '${targetRoleId}' to user '${targetUserId}'...`, logContext);
             await targetUserRef.update({
-                role: roleId,
-                updatedAt: FieldValue.serverTimestamp(),
+                role: targetRoleId,
+                updatedAt: FieldValue.serverTimestamp()
+                // Consider clearing specific permissions if role changes?
+                // permissions: FieldValue.delete()
             });
+            logger.info(`${functionName} Role assigned successfully.`, logContext);
 
-            // 5. Set Custom Claim in Firebase Auth
-            // This is crucial for enforcing rules based on role in Firestore/Storage/Functions
-            logger.info(`${functionName} Setting custom claim 'role=${roleId}' for user '${targetUserId}'.`, logContext);
-            await auth.setCustomUserClaims(targetUserId, { role: roleId });
-            // Note: Client needs to refresh ID token to get the new claim (e.g., user.getIdToken(true))
+            // 5. Log Admin Action (Async)
+            logAdminAction("AssignRoleToUser", { targetUserId, targetRoleId, triggerUserId: adminUserId }).catch(err => logger.error("Failed logging admin action", { err }));
 
-            logger.info(`${functionName} Role '${roleId}' assigned successfully to user '${targetUserId}'.`, logContext);
-
-            // 6. Log Admin Action (Async)
-            logAdminAction("AssignRoleToUser", { targetUserId, oldRole: targetUserData.role, newRole: roleId, triggerUserId: adminUserId }).catch(err => logger.error("Failed logging admin action", { err }));
-
-            // 7. Return Success
+            // 6. Return Success
             return { success: true };
 
         } catch (error: any) {
-            if (error instanceof HttpsError) throw error; // Re-throw HttpsErrors
-
-            if ((error as any)?.code === 5) { // Firestore NOT_FOUND (should be caught above, but defensive)
-                 logger.error(`${functionName} User or Role not found during assignment.`, { ...logContext, error: error.message });
-                 return { success: false, error: "error.notFound", errorCode: ErrorCode.NotFound };
-            }
-            if ((error as any)?.code?.startsWith('auth/')) { // Firebase Auth errors
-                logger.error(`${functionName} Firebase Auth error setting custom claim for user '${targetUserId}'.`, { ...logContext, error: error.message, code: (error as any).code });
-                 // Should we revert the Firestore update? Complex. Log critical error for now.
-                 logAdminAction("AssignRoleFailedAuth", { targetUserId, roleId, reason: error.message, code: (error as any).code, triggerUserId: adminUserId }).catch(...);
-                 return { success: false, error: "error.auth.setClaimsFailed", errorCode: ErrorCode.FirebaseAuthError };
-            }
-
-            logger.error(`${functionName} Failed to assign role '${roleId}' to user '${targetUserId}'.`, { ...logContext, error: error.message });
+            logger.error(`${functionName} Failed to assign role '${targetRoleId}' to user '${targetUserId}'.`, { ...logContext, error: error.message });
+            // Handle potential update errors
             return { success: false, error: "error.internalServer", errorCode: ErrorCode.InternalError };
         } finally {
             logger.info(`${functionName} Execution finished. Duration: ${Date.now() - startTimeFunc}ms`, logContext);
         }
     }
 );
+
+// Potential future function: removeRoleFromUser, assignDirectPermission, removeDirectPermission
