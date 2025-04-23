@@ -9,13 +9,11 @@ import {
 } from '../models'; // Adjust path if needed
 
 // --- Import Helpers ---
-// import { checkPermission } from '../utils/permissions'; // Still using mock below
-import { voidAuthorization, processRefund, extractPaymentDetailsFromResult } from '../utils/payment_helpers'; // <-- Import from new helper
+import { checkPermission } from '../utils/permissions'; // <-- Import REAL helper
+import { voidAuthorization, processRefund, extractPaymentDetailsFromResult } from '../utils/payment_helpers';
 // import { logUserActivity, logAdminAction } from '../utils/logging'; // Still using mock below
 
-// --- Mocks for required helper functions (Replace with actual implementations) ---
-async function checkPermission(userId: string | null, userRole: string | null, permissionId: string, context?: any): Promise<boolean> { logger.info(`[Mock Auth] Check ${permissionId} for ${userId} (${userRole})`, context); return userId != null; }
-// voidAuthorization and processRefund are now imported from the helper
+// --- Mocks for other required helper functions (Replace with actual implementations) ---
 async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); }
 async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); }
 // --- End Mocks ---
@@ -35,8 +33,8 @@ enum ErrorCode {
     InternalError = "INTERNAL_ERROR",
     // Specific codes
     OrderNotFound = "ORDER_NOT_FOUND",
-    UserNotFound = "USER_NOT_FOUND", // Added for completeness
-    NotOrderOwnerOrAdmin = "NOT_ORDER_OWNER_OR_ADMIN", // Adjusted permission logic
+    UserNotFound = "USER_NOT_FOUND",
+    NotOrderOwnerOrAdmin = "NOT_ORDER_OWNER_OR_ADMIN",
     InvalidOrderStatus = "INVALID_ORDER_STATUS", // Not cancellable from this state
     PaymentVoidFailed = "PAYMENT_VOID_FAILED",
     PaymentRefundFailed = "PAYMENT_REFUND_FAILED",
@@ -59,7 +57,7 @@ export const cancelOrder = functions.https.onCall(
         // secrets: ["PAYMENT_GATEWAY_SECRET"], // Uncomment if payment helper needs secrets
     },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[cancelOrder V2 - Refactored]";
+        const functionName = "[cancelOrder V3 - Permissions]";
         const startTimeFunc = Date.now();
 
         // 1. Authentication & Authorization
@@ -82,7 +80,7 @@ export const cancelOrder = functions.https.onCall(
         // --- Variables ---
         let orderData: Order;
         let userData: User;
-        let userRole: string | null;
+        let userRole: string | null; // Fetch user role
         let voidResult: Awaited<ReturnType<typeof voidAuthorization>> | null = null;
         let refundResult: Awaited<ReturnType<typeof processRefund>> | null = null;
         let updatedPaymentStatus: PaymentStatus;
@@ -99,7 +97,7 @@ export const cancelOrder = functions.https.onCall(
             // Validate User
             if (!userSnap.exists) throw new HttpsError('not-found', `error.user.notFound::${userId}`, { errorCode: ErrorCode.UserNotFound });
             userData = userSnap.data() as User;
-            userRole = userData.role;
+            userRole = userData.role; // Get role
             logContext.userRole = userRole;
 
             // Validate Order
@@ -112,154 +110,118 @@ export const cancelOrder = functions.https.onCall(
             logContext.paymentStatus = orderData.paymentStatus;
             logContext.orderCustomerId = orderData.customerId;
 
-            // 4. Permission Check (Allow owner or admin?)
+            // 4. Permission Check (Using REAL helper)
             const isOwner = userId === orderData.customerId;
             const isAdmin = userRole === 'Admin' || userRole === 'SuperAdmin';
-            // Define permissions needed: e.g., 'order:cancel:own', 'order:cancel:any'
-            const requiredPermission = isOwner ? 'order:cancel:own' : (isAdmin ? 'order:cancel:any' : 'permission_denied'); // Deny if not owner or admin
-            const hasPermission = await checkPermission(userId, userRole, requiredPermission, { orderId });
+            const requiredPermission = isOwner ? 'order:cancel:own' : (isAdmin ? 'order:cancel:any' : 'permission_denied');
+            // Pass fetched role to checkPermission to potentially save a read
+            const hasPermission = await checkPermission(userId, userRole, requiredPermission, logContext);
 
-            if (!hasPermission) { // Simplified check: must be owner or admin
+            if (!hasPermission) {
                 logger.warn(`${functionName} Permission denied for user ${userId} (Role: ${userRole}) to cancel order ${orderId}.`, logContext);
-                return { success: false, error: "error.permissionDenied.cancelOrder", errorCode: ErrorCode.NotOrderOwnerOrAdmin };
+                // Use specific error code if possible, otherwise generic permission denied
+                const errorCode = (requiredPermission === 'permission_denied') ? ErrorCode.PermissionDenied : ErrorCode.NotOrderOwnerOrAdmin;
+                return { success: false, error: "error.permissionDenied.cancelOrder", errorCode: errorCode };
             }
 
-            // 5. State Validation (Allow cancellation only in specific states)
-            // Example: Allow cancelling 'Red' or 'Yellow' status orders. Maybe 'Authorized' payment status.
+            // 5. State Validation
             const cancellableStatuses: string[] = [OrderStatus.Red.toString(), OrderStatus.Yellow.toString()];
             if (!cancellableStatuses.includes(orderData.status)) {
                 logger.warn(`${functionName} Order ${orderId} cannot be cancelled from status '${orderData.status}'.`, logContext);
                 return { success: false, error: `error.order.invalidStatus.cancel::${orderData.status}`, errorCode: ErrorCode.InvalidOrderStatus };
             }
-            // Additional check: Don't allow cancelling if already cancelled
             if (orderData.status === OrderStatus.Cancelled) {
                  logger.warn(`${functionName} Order ${orderId} is already cancelled.`, logContext);
                  return { success: false, error: "error.order.alreadyCancelled", errorCode: ErrorCode.FailedPrecondition };
             }
 
             // 6. Handle Payment Void/Refund (if applicable)
-            updatedPaymentStatus = orderData.paymentStatus; // Start with current status
+            updatedPaymentStatus = orderData.paymentStatus;
 
             if (orderData.paymentStatus === PaymentStatus.Authorized) {
-                // --- Void Authorization ---
                 const authId = orderData.authDetails?.authorizationId;
                 if (!authId) {
-                    logger.error(`${functionName} Cannot void payment for order ${orderId}: Missing authorizationId in authDetails.`, logContext);
                     throw new HttpsError('internal', `error.internal.missingPaymentInfo::${orderId}`, { errorCode: ErrorCode.MissingPaymentInfo });
                 }
                 logger.info(`${functionName} Order ${orderId}: Payment is Authorized. Attempting to void authorization ${authId}...`, logContext);
                 voidResult = await voidAuthorization(authId);
-
+                updatedPaymentStatus = voidResult.success ? PaymentStatus.Voided : PaymentStatus.VoidFailed;
                 if (!voidResult.success) {
-                    updatedPaymentStatus = PaymentStatus.VoidFailed; // Mark as failed
                     logger.error(`${functionName} Payment void failed for order ${orderId}, AuthID: ${authId}.`, { ...logContext, error: voidResult.errorMessage, code: voidResult.errorCode });
-                    // Should we still cancel the order in Firestore? Yes, but mark payment status accordingly.
-                    // Don't throw error here, let the transaction handle the order status update.
                 } else {
-                    updatedPaymentStatus = PaymentStatus.Voided;
                     logger.info(`${functionName} Payment void successful for order ${orderId}, AuthID: ${authId}.`, logContext);
                 }
             } else if (orderData.paymentStatus === PaymentStatus.Captured || orderData.paymentStatus === PaymentStatus.Paid) {
-                // --- Process Refund ---
-                // This might have different rules depending on who is cancelling and why.
-                // For simplicity now, we'll try to refund the finalAmount if captured/paid.
-                const transactionId = orderData.paymentDetails?.transactionId ?? orderData.authDetails?.transactionId; // Find the charge/capture ID
-                const amountToRefund = orderData.finalAmount; // Refund the final amount paid
+                const transactionId = orderData.paymentDetails?.transactionId ?? orderData.authDetails?.transactionId;
+                const amountToRefund = orderData.finalAmount;
 
                 if (!transactionId) {
-                     logger.error(`${functionName} Cannot refund payment for order ${orderId}: Missing transactionId in paymentDetails/authDetails.`, logContext);
                      throw new HttpsError('internal', `error.internal.missingPaymentInfo::${orderId}`, { errorCode: ErrorCode.MissingPaymentInfo });
                 }
-                 if (amountToRefund == null || amountToRefund <= 0) {
-                     logger.warn(`${functionName} Order ${orderId}: No amount to refund (${amountToRefund}). Skipping refund process.`, logContext);
-                     // If amount is 0 (e.g., paid by UC coins), just proceed with cancellation.
-                 } else {
+                 if (amountToRefund != null && amountToRefund > 0) {
                     logger.info(`${functionName} Order ${orderId}: Payment is ${orderData.paymentStatus}. Attempting to refund ${amountToRefund} ${orderData.currencyCode} for transaction ${transactionId}...`, logContext);
                     refundResult = await processRefund(
-                        transactionId,
-                        amountToRefund,
-                        orderData.currencyCode,
-                        reason || (isOwner ? "customer_request" : "admin_cancellation"),
-                        orderId
+                        transactionId, amountToRefund, orderData.currencyCode,
+                        reason || (isOwner ? "customer_request" : "admin_cancellation"), orderId
                     );
-
+                    updatedPaymentStatus = refundResult.success ? PaymentStatus.Refunded : PaymentStatus.RefundFailed;
                     if (!refundResult.success) {
-                        updatedPaymentStatus = PaymentStatus.RefundFailed; // Mark as failed
                         logger.error(`${functionName} Payment refund failed for order ${orderId}, TxID: ${transactionId}.`, { ...logContext, error: refundResult.errorMessage, code: refundResult.errorCode });
-                        // Still cancel the order, but mark payment status.
                     } else {
-                        updatedPaymentStatus = PaymentStatus.Refunded;
                         logger.info(`${functionName} Payment refund successful for order ${orderId}, TxID: ${transactionId}, RefundID: ${refundResult.refundId}.`, logContext);
-                        // Prepare refund details to store in the order
                         refundDetails = {
-                            refundId: refundResult.refundId,
-                            refundTimestamp: refundResult.timestamp,
-                            refundAmountSmallestUnit: refundResult.amountRefunded,
-                            gatewayName: refundResult.gatewayName,
+                            refundId: refundResult.refundId, refundTimestamp: refundResult.timestamp,
+                            refundAmountSmallestUnit: refundResult.amountRefunded, gatewayName: refundResult.gatewayName,
                             reason: reason || (isOwner ? "customer_request" : "admin_cancellation"),
                         };
                     }
+                 } else {
+                     logger.warn(`${functionName} Order ${orderId}: No amount to refund (${amountToRefund}). Skipping refund process.`, logContext);
                  }
-
             } else {
-                // Handle other payment statuses (Pending, Failed, Voided, Refunded etc.) - usually no payment action needed on cancellation.
                 logger.info(`${functionName} Order ${orderId}: No payment action required for cancellation based on current payment status '${orderData.paymentStatus}'.`, logContext);
             }
             logContext.updatedPaymentStatus = updatedPaymentStatus;
 
             // 7. Firestore Transaction to Update Order Status
-            // Note: Inventory restoration is handled by the background function triggered by order status change.
             logger.info(`${functionName} Starting Firestore transaction to update order status...`, logContext);
             await db.runTransaction(async (transaction) => {
                 const orderTxSnap = await transaction.get(orderRef);
-                if (!orderTxSnap.exists) throw new Error(`TX_ERR::${ErrorCode.OrderNotFound}`); // Should not happen
+                if (!orderTxSnap.exists) throw new Error(`TX_ERR::${ErrorCode.OrderNotFound}`);
                 const orderTxData = orderTxSnap.data() as Order;
 
-                // Re-validate status in transaction
                 if (orderTxData.status === OrderStatus.Cancelled) {
                     logger.warn(`${functionName} TX Conflict: Order ${orderId} was already cancelled. Aborting update.`);
-                    return; // Already cancelled, do nothing
+                    return;
                 }
                 if (!cancellableStatuses.includes(orderTxData.status)) {
                      logger.warn(`${functionName} TX Conflict: Order ${orderId} status changed to ${orderTxData.status} during TX. Aborting cancellation.`);
-                     return; // Status changed to non-cancellable state
+                     return;
                 }
 
-                // Prepare Order Update
                 const now = Timestamp.now();
                 const updateData: { [key: string]: any } = {
                     status: OrderStatus.Cancelled,
-                    paymentStatus: updatedPaymentStatus, // Update based on void/refund result
+                    paymentStatus: updatedPaymentStatus,
                     updatedAt: FieldValue.serverTimestamp(),
                     statusHistory: FieldValue.arrayUnion({
-                        status: OrderStatus.Cancelled,
-                        timestamp: now,
-                        userId: userId,
-                        role: userRole,
+                        status: OrderStatus.Cancelled, timestamp: now, userId: userId, role: userRole,
                         reason: `Cancelled by ${userRole ?? 'User'}${reason ? `: ${reason}` : ''}`
                     }),
-                    processingError: null, // Clear previous errors
+                    processingError: null,
                 };
-                // Add refund details if applicable
-                if (refundDetails) {
-                    updateData.refundDetails = refundDetails;
-                }
-                // Add void failure details? Maybe store in paymentDetails error fields?
-                 if (voidResult && !voidResult.success) {
+                if (refundDetails) updateData.refundDetails = refundDetails;
+                if (voidResult && !voidResult.success) {
                      updateData['authDetails.voidErrorCode'] = voidResult.errorCode;
                      updateData['authDetails.voidErrorMessage'] = voidResult.errorMessage;
                  }
                  if (refundResult && !refundResult.success) {
-                      updateData['paymentDetails.refundErrorCode'] = refundResult.errorCode; // Assuming paymentDetails exists if refund was attempted
+                      updateData['paymentDetails.refundErrorCode'] = refundResult.errorCode;
                       updateData['paymentDetails.refundErrorMessage'] = refundResult.errorMessage;
                  }
-
-
-                // Perform Write
                 transaction.update(orderRef, updateData);
-            }); // End Transaction
+            });
             logger.info(`${functionName} Order ${orderId} status updated to Cancelled successfully.`, logContext);
-
 
             // 8. Log Action (Async)
             const logDetails = { orderId, customerId: orderData.customerId, cancelledBy: userId, userRole, reason, initialStatus: orderData.status, finalPaymentStatus: updatedPaymentStatus };
@@ -268,9 +230,6 @@ export const cancelOrder = functions.https.onCall(
             } else {
                 logUserActivity("CancelOrder", logDetails, userId).catch(err => logger.error("Failed logging user activity", { err }));
             }
-
-            // Note: The background function 'handleOrderCancellationSideEffects' should be triggered
-            // by this status update to handle inventory restoration, etc.
 
             // 9. Return Success
             return { success: true };
@@ -295,7 +254,6 @@ export const cancelOrder = functions.https.onCall(
                  if (parts[2]) finalErrorMessageKey += `::${parts[2]}`;
             }
 
-            // Log failure activity?
             logUserActivity("CancelOrderFailed", { orderId, reason, error: error.message }, userId).catch(...)
 
             return { success: false, error: finalErrorMessageKey, errorCode: finalErrorCode };
