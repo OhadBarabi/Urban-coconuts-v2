@@ -4,24 +4,14 @@ import * as admin from "firebase-admin";
 import { HttpsError } from "firebase-functions/v2/https";
 
 // --- Import Models ---
-import {
-    User, Box, RentalItem, RentalBooking, RentalBookingStatus
-} from '../models'; // Adjust path if needed
+import { User, RentalBooking, RentalBookingStatus, Box } from '../models'; // Adjust path if needed
 
-// --- Assuming helper functions are imported or defined elsewhere ---
-// import { checkPermission } from '../utils/permissions';
-// import { triggerHandleRentalDeposit } from '../utils/background_triggers'; // Trigger for deposit processing
-// import { sendPushNotification } from '../utils/notifications';
-// import { logUserActivity, logAdminAction } from '../utils/logging';
-// import { uploadImageToStorage } from '../utils/storage_helpers'; // If uploading photo
+// --- Import Helpers ---
+import { checkPermission } from '../utils/permissions'; // <-- Import REAL helper
+// import { logUserActivity } from '../utils/logging'; // Still using mock below
 
-// --- Mocks for required helper functions (Replace with actual implementations) ---
-async function checkPermission(userId: string | null, permissionId: string, context?: any): Promise<boolean> { logger.info(`[Mock Auth] Check ${permissionId} for ${userId}`, context); return userId != null; }
-async function triggerHandleRentalDeposit(params: { bookingId: string }): Promise<void> { logger.info(`[Mock Trigger] Triggering deposit handling for booking ${params.bookingId}`); }
-async function sendPushNotification(params: any): Promise<void> { logger.info(`[Mock Notification] Sending notification`, params); }
+// --- Mocks for other required helper functions (Replace with actual implementations) ---
 async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); }
-async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); }
-async function uploadImageToStorage(base64Image: string, path: string): Promise<string | null> { logger.info(`[Mock Storage] Uploading image to ${path}`); if (base64Image) return `https://mockstorage.google.com/${path}`; return null; }
 // --- End Mocks ---
 
 // --- Configuration ---
@@ -29,265 +19,239 @@ async function uploadImageToStorage(base64Image: string, path: string): Promise<
 const db = admin.firestore();
 const { FieldValue, Timestamp } = admin.firestore;
 const FUNCTION_REGION = "me-west1"; // <<<--- CHANGE TO YOUR REGION
-const RENTAL_RETURN_IMAGES_PATH = 'rentalReturns'; // Storage path
+const RENTAL_DEPOSIT_TOPIC = "rental-deposit-processing"; // Pub/Sub topic to trigger deposit handling
 
 // --- Enums ---
 enum ErrorCode {
     Unauthenticated = "UNAUTHENTICATED", PermissionDenied = "PERMISSION_DENIED", InvalidArgument = "INVALID_ARGUMENT",
-    NotFound = "NOT_FOUND", // Booking, User, Box not found
-    FailedPrecondition = "FAILED_PRECONDITION", // Invalid status or mismatch
+    NotFound = "NOT_FOUND", // Booking, User, or Box not found
+    FailedPrecondition = "FAILED_PRECONDITION", // Invalid status for return, Invalid condition value
     Aborted = "ABORTED", // Transaction failed
     InternalError = "INTERNAL_ERROR",
     // Specific codes
     BookingNotFound = "BOOKING_NOT_FOUND",
-    InvalidBookingStatus = "INVALID_BOOKING_STATUS", // Not PickedUp or ReturnOverdue
-    CourierNotAssignedToBox = "COURIER_NOT_ASSIGNED_TO_BOX", // Courier not at the return box
+    UserNotFound = "USER_NOT_FOUND",
+    BoxNotFound = "BOX_NOT_FOUND",
+    NotCourier = "NOT_COURIER",
+    InvalidBookingStatus = "INVALID_BOOKING_STATUS", // Not 'Out'
     InvalidReturnCondition = "INVALID_RETURN_CONDITION",
-    StorageUploadFailed = "STORAGE_UPLOAD_FAILED",
+    CourierMismatch = "COURIER_MISMATCH", // Courier not assigned to return box
+    PubSubError = "PUB_SUB_ERROR", // Failed to publish message
     TransactionFailed = "TRANSACTION_FAILED",
-    SideEffectTriggerFailed = "SIDE_EFFECT_TRIGGER_FAILED",
 }
-
-// Valid return conditions courier can select
-const VALID_RETURN_CONDITIONS = ["OK", "Dirty", "Damaged"];
 
 // --- Interfaces ---
+type ReturnCondition = "OK" | "Dirty" | "Damaged";
 interface ConfirmRentalReturnInput {
     bookingId: string;
-    returnBoxId: string; // Box where item is being returned
-    condition: "OK" | "Dirty" | "Damaged" | string; // Condition reported by courier
-    conditionPhotoBase64?: string | null; // Optional Base64 encoded photo for Dirty/Damaged
-    courierNotes?: string | null; // Optional notes from courier
+    returnBoxId: string; // ID of the box where the item is being returned
+    condition: ReturnCondition; // Condition of the returned item
+    conditionPhotoBase64?: string | null; // Optional Base64 encoded photo
+    courierNotes?: string | null; // Optional notes from the courier
 }
+
+// --- Helper to publish to Pub/Sub ---
+// TODO: Move to a dedicated Pub/Sub helper file?
+async function publishToPubSub(topicName: string, jsonData: object): Promise<void> {
+    const functionName = "[publishToPubSub]";
+    try {
+        const { PubSub } = await import('@google-cloud/pubsub'); // Lazy load
+        const pubSubClient = new PubSub();
+        const dataBuffer = Buffer.from(JSON.stringify(jsonData));
+        const messageId = await pubSubClient.topic(topicName).publishMessage({ data: dataBuffer });
+        logger.info(`${functionName} Message ${messageId} published to topic ${topicName}.`, { topicName, jsonData });
+    } catch (error: any) {
+        logger.error(`${functionName} Failed to publish message to topic ${topicName}.`, { error: error.message, topicName, jsonData });
+        // Throw a specific error to be caught by the main function
+        throw new HttpsError('internal', `Failed to publish to Pub/Sub topic ${topicName}`, { errorCode: ErrorCode.PubSubError });
+    }
+}
+
 
 // --- The Cloud Function ---
 export const confirmRentalReturn = functions.https.onCall(
     {
         region: FUNCTION_REGION,
-        memory: "1GiB", // Allow memory for potential image upload + transaction
+        memory: "1GiB", // Allow memory for transaction + potential image handling + pubsub
         timeoutSeconds: 60,
     },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[confirmRentalReturn V1]";
-        const startTime = Date.now();
+        const functionName = "[confirmRentalReturn V2 - Permissions]"; // Updated version name
+        const startTimeFunc = Date.now();
 
         // 1. Authentication & Authorization
-        if (!request.auth?.uid) {
-            logger.warn(`${functionName} Authentication failed: No UID.`);
-            return { success: false, error: "error.auth.unauthenticated", errorCode: ErrorCode.Unauthenticated };
-        }
-        const courierId = request.auth.uid; // Courier performing the return confirmation
+        if (!request.auth?.uid) { return { success: false, error: "error.auth.unauthenticated", errorCode: ErrorCode.Unauthenticated }; }
+        const courierId = request.auth.uid; // Courier performing the action
         const data = request.data as ConfirmRentalReturnInput;
         const logContext: any = { courierId, bookingId: data?.bookingId, returnBoxId: data?.returnBoxId, condition: data?.condition };
 
         logger.info(`${functionName} Invoked.`, logContext);
 
         // 2. Input Validation
+        const validConditions: ReturnCondition[] = ["OK", "Dirty", "Damaged"];
         if (!data?.bookingId || typeof data.bookingId !== 'string' ||
-            !data.returnBoxId || typeof data.returnBoxId !== 'string' ||
-            !data.condition || !VALID_RETURN_CONDITIONS.includes(data.condition) ||
+            !data?.returnBoxId || typeof data.returnBoxId !== 'string' ||
+            !data?.condition || !validConditions.includes(data.condition) ||
             (data.conditionPhotoBase64 != null && typeof data.conditionPhotoBase64 !== 'string') || // Basic check
             (data.courierNotes != null && typeof data.courierNotes !== 'string'))
         {
-            logger.error(`${functionName} Invalid input data structure or types.`, { ...logContext, data: { ...data, conditionPhotoBase64: data.conditionPhotoBase64 ? 'Present' : 'Not Present'} });
-            return { success: false, error: "error.invalidInput.structure", errorCode: ErrorCode.InvalidArgument };
+            logger.error(`${functionName} Invalid input data structure or types.`, { ...logContext, data: JSON.stringify(data).substring(0,500) });
+            let errorCode = ErrorCode.InvalidArgument;
+            if (data?.condition && !validConditions.includes(data.condition)) {
+                errorCode = ErrorCode.InvalidReturnCondition;
+            }
+            return { success: false, error: "error.invalidInput.structureOrCondition", errorCode: errorCode };
         }
         const { bookingId, returnBoxId, condition, conditionPhotoBase64, courierNotes } = data;
 
-        // Validate photo requirement for Dirty/Damaged
-        if ((condition === "Dirty" || condition === "Damaged") && !conditionPhotoBase64) {
-             logger.error(`${functionName} Photo required for condition '${condition}'.`, logContext);
-             return { success: false, error: `error.invalidInput.photoRequired::${condition}`, errorCode: ErrorCode.InvalidArgument };
-        }
+        // TODO: Handle conditionPhotoBase64 - upload to Cloud Storage and get URL
 
-        // --- Variables ---
-        let bookingData: RentalBooking;
-        let courierData: User;
-        let returnBoxData: Box;
-        let rentalItemData: RentalItem;
-        let conditionPhotoUrl: string | null = null;
-        let depositTriggerFailed = false;
+        // --- Firestore References ---
+        const bookingRef = db.collection('rentalBookings').doc(bookingId);
+        const courierRef = db.collection('users').doc(courierId); // Needed for role check
+        const returnBoxRef = db.collection('boxes').doc(returnBoxId); // Needed for inventory update
 
         try {
-            // Fetch Courier, Booking, Return Box Data Concurrently
-            const courierRef = db.collection('users').doc(courierId);
-            const bookingRef = db.collection('rentalBookings').doc(bookingId);
-            const returnBoxRef = db.collection('boxes').doc(returnBoxId);
-
-            const hasPermissionPromise = checkPermission(courierId, 'rental:confirm_return', { bookingId, returnBoxId });
-
-            const [courierSnap, bookingSnap, returnBoxSnap, hasPermission] = await Promise.all([
-                courierRef.get(), bookingRef.get(), returnBoxRef.get(), hasPermissionPromise
+            // 3. Fetch User, Booking, and Return Box Data Concurrently
+            const [courierSnap, bookingSnap, returnBoxSnap] = await Promise.all([
+                courierRef.get(),
+                bookingRef.get(),
+                returnBoxRef.get()
             ]);
 
-            // Validate Permission
-            if (!hasPermission) {
-                logger.warn(`${functionName} Permission denied for courier ${courierId}.`, logContext);
-                return { success: false, error: "error.permissionDenied.confirmReturn", errorCode: ErrorCode.PermissionDenied };
-            }
-
-            // Validate Courier
+            // Validate User (Courier)
             if (!courierSnap.exists) throw new HttpsError('not-found', `error.user.notFound::${courierId}`, { errorCode: ErrorCode.UserNotFound });
-            courierData = courierSnap.data() as User;
-            if (courierData.role !== Role.Courier || !courierData.isActive) {
-                 throw new HttpsError('permission-denied', "error.permissionDenied.notActiveCourier", { errorCode: ErrorCode.PermissionDenied });
+            const courierData = courierSnap.data() as User;
+            const courierRole = courierData.role; // Get role
+            logContext.userRole = courierRole;
+            if (courierRole !== 'Courier') {
+                 logger.warn(`${functionName} User ${courierId} is not a Courier.`, logContext);
+                 return { success: false, error: "error.permissionDenied.notCourier", errorCode: ErrorCode.NotCourier };
             }
 
             // Validate Booking
             if (!bookingSnap.exists) {
-                logger.warn(`${functionName} Booking ${bookingId} not found.`, logContext);
-                return { success: false, error: "error.booking.notFound", errorCode: ErrorCode.BookingNotFound };
+                logger.warn(`${functionName} Rental booking ${bookingId} not found.`, logContext);
+                return { success: false, error: "error.rental.bookingNotFound", errorCode: ErrorCode.BookingNotFound };
             }
-            bookingData = bookingSnap.data() as RentalBooking;
+            const bookingData = bookingSnap.data() as RentalBooking;
             logContext.currentStatus = bookingData.bookingStatus;
-            logContext.rentalItemId = bookingData.rentalItemId;
-            logContext.customerId = bookingData.customerId;
-
-            // Validate Booking Status (Must be picked up or overdue)
-            const validReturnStatuses: string[] = [
-                RentalBookingStatus.PickedUp.toString(),
-                RentalBookingStatus.AwaitingReturn.toString(), // If using this alias
-                RentalBookingStatus.ReturnOverdue.toString()
-            ];
-            if (!validReturnStatuses.includes(bookingData.bookingStatus)) {
-                logger.warn(`${functionName} Booking ${bookingId} has invalid status: ${bookingData.bookingStatus}. Expected PickedUp/AwaitingReturn/ReturnOverdue.`, logContext);
-                 // Idempotency: If already returned, maybe allow update of condition/notes? Or just succeed? Let's succeed.
-                 if (bookingData.bookingStatus === RentalBookingStatus.ReturnedPendingInspection || bookingData.bookingStatus === RentalBookingStatus.ReturnProcessing || bookingData.bookingStatus === RentalBookingStatus.ReturnCompleted) {
-                     logger.info(`${functionName} Booking ${bookingId} already marked as returned. Idempotent success.`);
-                     return { success: true };
-                 }
-                return { success: false, error: `error.booking.invalidStatus.return::${bookingData.bookingStatus}`, errorCode: ErrorCode.InvalidBookingStatus };
-            }
+            logContext.rentalItemId = bookingData.rentalItemId; // Needed for inventory update
 
             // Validate Return Box
-            if (!returnBoxSnap.exists) throw new HttpsError('not-found', `error.box.notFound::${returnBoxId}`, { errorCode: ErrorCode.BoxNotFound });
-            returnBoxData = returnBoxSnap.data() as Box;
-            if (!returnBoxData.isActive) throw new HttpsError('failed-precondition', `error.box.inactive::${returnBoxId}`, { errorCode: ErrorCode.BoxInactive });
-            // Validate Courier is assigned to the RETURN box
+            if (!returnBoxSnap.exists) {
+                 logger.warn(`${functionName} Return box ${returnBoxId} not found.`, logContext);
+                 return { success: false, error: "error.box.notFound", errorCode: ErrorCode.BoxNotFound };
+            }
+             // Optional: Check if return box is active?
+             // const returnBoxData = returnBoxSnap.data() as Box;
+             // if (!returnBoxData.isActive) { ... }
+
+
+            // 4. Permission Check (Using REAL helper)
+            // Courier needs permission to confirm return, potentially tied to the box they are assigned to.
+            // Define permission: 'rental:return:confirm'
+            // Pass fetched role to checkPermission
+            const hasPermission = await checkPermission(courierId, courierRole, 'rental:return:confirm', logContext);
+            if (!hasPermission) {
+                logger.warn(`${functionName} Permission denied for courier ${courierId} to confirm return for booking ${bookingId}.`, logContext);
+                return { success: false, error: "error.permissionDenied.confirmReturn", errorCode: ErrorCode.PermissionDenied };
+            }
+            // Additional check: Is the courier assigned to the RETURN box?
             if (courierData.currentBoxId !== returnBoxId) {
-                 logger.error(`${functionName} Courier ${courierId} is not currently assigned to return box ${returnBoxId} (Current: ${courierData.currentBoxId}).`, logContext);
-                 return { success: false, error: "error.courier.notAtReturnBox", errorCode: ErrorCode.CourierNotAssignedToBox };
+                 logger.warn(`${functionName} Courier ${courierId} is not currently assigned to the return box ${returnBoxId} for booking ${bookingId}.`, logContext);
+                 return { success: false, error: "error.rental.courierMismatchReturn", errorCode: ErrorCode.CourierMismatch };
             }
 
-            // Fetch Rental Item (Needed for inventory update)
-            const rentalItemId = bookingData.rentalItemId;
-            if (!rentalItemId) throw new HttpsError('internal', `Booking ${bookingId} missing rentalItemId.`);
-            const rentalItemRef = db.collection('rentalItems').doc(rentalItemId);
-            const rentalItemSnap = await rentalItemRef.get();
-            if (!rentalItemSnap.exists) throw new HttpsError('not-found', `error.rentalItem.notFound::${rentalItemId}`, { errorCode: ErrorCode.RentalItemNotFound });
-            rentalItemData = rentalItemSnap.data() as RentalItem;
 
-
-            // 3. Upload Condition Photo (if provided)
-            if (conditionPhotoBase64) {
-                logger.info(`${functionName} Uploading condition photo for booking ${bookingId}...`, logContext);
-                const imagePath = `${RENTAL_RETURN_IMAGES_PATH}/${bookingId}/${Date.now()}.jpg`; // Example path
-                try {
-                    // Assuming base64 includes data prefix (e.g., "data:image/jpeg;base64,...")
-                    const base64Data = conditionPhotoBase64.split(',')[1] ?? conditionPhotoBase64;
-                    conditionPhotoUrl = await uploadImageToStorage(base64Data, imagePath); // Use actual helper
-                    if (!conditionPhotoUrl) throw new Error("Upload returned null URL");
-                    logger.info(`${functionName} Condition photo uploaded successfully: ${conditionPhotoUrl}`, logContext);
-                } catch (uploadError: any) {
-                    logger.error(`${functionName} Failed to upload condition photo. Proceeding without photo URL.`, { ...logContext, error: uploadError.message });
-                    // Don't fail the whole process, but log it. Maybe set a flag?
-                    // throw new HttpsError('internal', "error.storage.uploadFailed", { errorCode: ErrorCode.StorageUploadFailed });
-                }
+            // 5. State Validation
+            if (bookingData.bookingStatus !== RentalBookingStatus.Out) {
+                logger.warn(`${functionName} Rental booking ${bookingId} is not in 'Out' status (current: ${bookingData.bookingStatus}). Cannot confirm return.`, logContext);
+                 // Handle case where it might already be 'Returned' - maybe return success?
+                 if (bookingData.bookingStatus === RentalBookingStatus.Returned) {
+                      logger.info(`${functionName} Booking ${bookingId} already marked as 'Returned'. Assuming confirmation already happened.`, logContext);
+                      return { success: true }; // Idempotency
+                 }
+                return { success: false, error: `error.rental.invalidStatus.return::${bookingData.bookingStatus}`, errorCode: ErrorCode.InvalidBookingStatus };
             }
 
-            // 4. Firestore Transaction
-            logger.info(`${functionName} Starting Firestore transaction to process return for booking ${bookingId}...`, logContext);
+            // 6. Firestore Transaction to Update Booking Status and Restore Inventory
+            logger.info(`${functionName} Starting Firestore transaction...`, logContext);
+            const conditionPhotoUrl = null; // Placeholder - Upload photo logic needed here
+            logContext.conditionPhotoUrl = conditionPhotoUrl; // Log placeholder or actual URL
+
             await db.runTransaction(async (transaction) => {
-                const now = Timestamp.now();
-
-                // Re-read Booking & Box within TX
+                // Re-read booking and box within transaction
                 const bookingTxSnap = await transaction.get(bookingRef);
-                const boxTxSnap = await transaction.get(returnBoxRef);
-                // No need to re-read item type unless its status could change
+                const boxTxSnap = await transaction.get(returnBoxRef); // Read return box
 
                 if (!bookingTxSnap.exists) throw new Error(`TX_ERR::${ErrorCode.BookingNotFound}`);
+                if (!boxTxSnap.exists) throw new Error(`TX_ERR::${ErrorCode.BoxNotFound}::${returnBoxId}`);
                 const bookingTxData = bookingTxSnap.data() as RentalBooking;
-                if (!boxTxSnap.exists) throw new Error(`TX_ERR::${ErrorCode.BoxNotFound}`);
-                const boxTxData = boxTxSnap.data() as Box;
+                // const boxTxData = boxTxSnap.data() as Box; // Not needed for write logic
 
-                // Re-validate status
-                if (!validReturnStatuses.includes(bookingTxData.bookingStatus)) {
-                     logger.warn(`${functionName} TX Conflict: Booking ${bookingId} status changed to ${bookingTxData.bookingStatus} during TX. Aborting return.`, logContext);
+                 // Re-validate status
+                 if (bookingTxData.bookingStatus !== RentalBookingStatus.Out) {
+                     logger.warn(`${functionName} TX Conflict: Booking ${bookingId} status changed to ${bookingTxData.bookingStatus} during TX. Aborting return confirmation.`);
                      return; // Abort gracefully
-                }
-                if (!boxTxData.isActive) throw new Error(`TX_ERR::${ErrorCode.BoxInactive}`);
+                 }
 
-
-                // Prepare Booking Update
-                const bookingUpdateData: Partial<RentalBooking> = {
-                    bookingStatus: RentalBookingStatus.ReturnedPendingInspection, // Move to inspection state
-                    actualReturnTimestamp: now,
+                // --- Prepare Booking Update ---
+                const now = Timestamp.now();
+                const updateData: { [key: string]: any } = {
+                    bookingStatus: RentalBookingStatus.Returned,
                     returnBoxId: returnBoxId,
-                    returnCourierId: courierId,
+                    actualReturnTimestamp: now,
                     returnedCondition: condition,
-                    returnedConditionPhotoUrl: conditionPhotoUrl, // Store URL if upload succeeded
+                    returnedConditionPhotoUrl: conditionPhotoUrl, // Add the actual URL if uploaded
                     courierNotesOnReturn: courierNotes ?? null,
+                    returnCourierId: courierId, // Record which courier confirmed return
                     updatedAt: FieldValue.serverTimestamp(),
                     processingError: null, // Clear previous errors
+                    depositProcessed: false, // Ensure flag is false before triggering background function
                 };
+                transaction.update(bookingRef, updateData);
 
-                // Prepare Box Inventory Update (Increment count for the returned item type)
-                // **ASSUMPTION:** Inventory is stored like: box.rentalInventory = { "mat_standard": 5, "mat_large": 2 }
-                const inventoryUpdate = { [`rentalInventory.${rentalItemId}`]: FieldValue.increment(1) };
-
-                // --- Perform Writes ---
-                // 1. Update Rental Booking
-                transaction.update(bookingRef, bookingUpdateData);
-                // 2. Update Box Inventory
+                // --- Prepare Inventory Update ---
+                // Return the item to the RETURN box's inventory
+                const inventoryUpdate = {
+                    [`rentalInventory.${bookingData.rentalItemId}`]: FieldValue.increment(1)
+                };
                 transaction.update(returnBoxRef, inventoryUpdate);
 
-            }); // End Firestore Transaction
-            logger.info(`${functionName} Firestore transaction successful for booking ${bookingId} return.`);
+            }); // End Transaction
+            logger.info(`${functionName} Transaction successful. Booking ${bookingId} marked as Returned and inventory restored to box ${returnBoxId}.`, logContext);
 
-            // 5. Trigger Deposit Handling Background Function (Async)
-            logger.info(`${functionName} Triggering deposit handling for booking ${bookingId}...`, logContext);
-            try {
-                await triggerHandleRentalDeposit({ bookingId });
-            } catch (triggerError: any) {
-                 depositTriggerFailed = true;
-                 logger.error(`${functionName} CRITICAL: Failed to trigger deposit handling for booking ${bookingId}. Manual processing required.`, { ...logContext, error: triggerError.message });
-                 // Update booking with flag (best effort outside TX)
-                 bookingRef.update({ processingError: `Deposit handling trigger failed: ${triggerError.message}` }).catch(...);
-                 logAdminAction("DepositHandleTriggerFailed", { bookingId, reason: triggerError.message }).catch(...);
-                 // Send Admin Alert
-                 sendPushNotification({ subject: `Deposit Handling Trigger FAILED - Booking ${bookingId}`, body: `Failed to trigger deposit handling for returned rental ${bookingId}. Manual calculation and charge/refund required.`, bookingId, severity: "critical" }).catch(...);
-                 // Do NOT fail the main function for this async trigger failure.
-            }
+            // 7. Trigger Background Function to Handle Deposit (Capture/Void)
+            // Publish bookingId to Pub/Sub topic
+            logger.info(`${functionName} Publishing message to ${RENTAL_DEPOSIT_TOPIC} for booking ${bookingId}...`, logContext);
+            await publishToPubSub(RENTAL_DEPOSIT_TOPIC, { bookingId: bookingId });
+            logger.info(`${functionName} Message published successfully.`, logContext);
 
-            // 6. Trigger Notifications (Async) - e.g., to customer confirming return received
-            if (bookingData.customerId) {
-                sendPushNotification({
-                    userId: bookingData.customerId, type: "RentalReturned", titleKey: "notification.rentalReturned.title",
-                    messageKey: "notification.rentalReturned.message", messageParams: { itemName: rentalItemData.itemName_i18n?.['en'] ?? rentalItemId },
-                    payload: { bookingId: bookingId, screen: 'RentalDetails' }
-                }).catch(err => logger.error("Failed sending customer return notification", { err }));
-            }
 
-            // 7. Log Action (Async)
-            logUserActivity("ConfirmRentalReturn", { bookingId, customerId: bookingData.customerId, rentalItemId, returnBoxId, condition, photoUploaded: !!conditionPhotoUrl, depositTriggerFailed }, courierId)
+            // 8. Log User Activity (Async)
+            logUserActivity("ConfirmRentalReturn", { bookingId, customerId: bookingData.customerId, returnBoxId, condition }, courierId)
                 .catch(err => logger.error("Failed logging user activity", { err }));
 
-            // 8. Return Success
+            // 9. Return Success
             return { success: true };
 
         } catch (error: any) {
             // Error Handling
             logger.error(`${functionName} Execution failed.`, { ...logContext, error: error?.message, details: error?.details });
             const isHttpsError = error instanceof HttpsError;
-            const code = isHttpsError ? error.code : 'UNKNOWN';
             let finalErrorCode: ErrorCode = ErrorCode.InternalError;
             let finalErrorMessageKey: string = "error.internalServer";
 
             if (isHttpsError) {
                 finalErrorCode = (error.details as any)?.errorCode as ErrorCode || ErrorCode.InternalError;
-                finalErrorMessageKey = error.message.startsWith("error.") ? error.message : `error.confirmRentalReturn.generic`;
-                if (!Object.values(ErrorCode).includes(finalErrorCode)) finalErrorCode = ErrorCode.InternalError;
+                finalErrorMessageKey = error.message.startsWith("error.") ? error.message : `error.confirmReturn.generic`;
+                 if (!Object.values(ErrorCode).includes(finalErrorCode)) finalErrorCode = ErrorCode.InternalError;
                  if (error.message.includes("::")) { finalErrorMessageKey = error.message; }
+                 // Handle specific Pub/Sub error
+                 if (finalErrorCode === ErrorCode.PubSubError) {
+                     finalErrorMessageKey = "error.pubsub.publishFailed";
+                 }
             } else if (error.message?.startsWith("TX_ERR::")) {
                  const parts = error.message.split('::');
                  const txErrCode = parts[1] as ErrorCode;
@@ -296,12 +260,20 @@ export const confirmRentalReturn = functions.https.onCall(
                  if (parts[2]) finalErrorMessageKey += `::${parts[2]}`;
             }
 
-            // Log admin action failure if needed
-            logAdminAction("ConfirmRentalReturnFailed", { inputData: data, triggerUserId: courierId, errorMessage: error.message, finalErrorCode }).catch(...)
+            logUserActivity("ConfirmRentalReturnFailed", { bookingId, returnBoxId, condition, error: error.message }, courierId).catch(...)
+
+            // If transaction succeeded but Pub/Sub failed, the booking is marked 'Returned' but deposit won't be processed automatically.
+            // May need manual intervention or retry mechanism for Pub/Sub.
+            if (finalErrorCode === ErrorCode.PubSubError) {
+                 logger.error(`${functionName} CRITICAL: Transaction succeeded but failed to trigger deposit processing for booking ${bookingId}. Requires manual check.`, logContext);
+                 // Optionally update the booking with an error flag specifically for Pub/Sub failure?
+                 // await bookingRef.update({ processingError: "Failed to trigger deposit processing" });
+            }
+
 
             return { success: false, error: finalErrorMessageKey, errorCode: finalErrorCode };
         } finally {
-             logger.info(`${functionName} Execution finished. Duration: ${Date.now() - startTime}ms`, logContext);
+             logger.info(`${functionName} Execution finished. Duration: ${Date.now() - startTimeFunc}ms`, logContext);
         }
     }
 );
