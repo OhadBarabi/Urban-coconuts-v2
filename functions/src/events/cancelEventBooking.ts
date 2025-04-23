@@ -5,19 +5,19 @@ import { HttpsError } from "firebase-functions/v2/https";
 
 // --- Import Models ---
 import {
-    User, EventBooking, EventBookingStatus, PaymentStatus, RefundDetails // Added RefundDetails
+    User, EventBooking, EventBookingStatus, PaymentStatus, RefundDetails
 } from '../models'; // Adjust path if needed
 
 // --- Import Helpers ---
-import { checkPermission } from '../utils/permissions'; // <-- Import REAL helper
-import { voidAuthorization, processRefund, extractPaymentDetailsFromResult } from '../utils/payment_helpers'; // Import payment helpers for potential void/refund
+import { checkPermission } from '../utils/permissions';
+import { voidAuthorization, processRefund, extractPaymentDetailsFromResult } from '../utils/payment_helpers';
+import { deleteGoogleCalendarEvent } from '../utils/google_calendar_helpers'; // <-- Import REAL helper
 // import { logUserActivity, logAdminAction } from '../utils/logging'; // Using mocks below
-// import { deleteGoogleCalendarEvent } from '../utils/google_calendar_helpers'; // Using mock below
 
 // --- Mocks for other required helper functions (Replace with actual implementations) ---
 async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); }
 async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); }
-async function deleteGoogleCalendarEvent(eventId: string): Promise<{ success: boolean; error?: string }> { logger.info(`[Mock GCal] Deleting event ${eventId}`); await new Promise(res => setTimeout(res, 300)); return { success: true }; }
+// deleteGoogleCalendarEvent is now imported from the helper
 // --- End Mocks ---
 
 // --- Configuration ---
@@ -25,7 +25,6 @@ async function deleteGoogleCalendarEvent(eventId: string): Promise<{ success: bo
 const db = admin.firestore();
 const { FieldValue, Timestamp } = admin.firestore;
 const FUNCTION_REGION = "me-west1"; // <<<--- CHANGE TO YOUR REGION
-// const EVENT_CALENDAR_DELETE_TOPIC = "delete-google-calendar-event"; // If triggering background func via Pub/Sub
 
 // --- Enums ---
 enum ErrorCode {
@@ -43,7 +42,7 @@ enum ErrorCode {
     PaymentRefundFailed = "PAYMENT_REFUND_FAILED",
     MissingPaymentInfo = "MISSING_PAYMENT_INFO",
     GcalDeleteFailed = "GCAL_DELETE_FAILED",
-    TransactionFailed = "TRANSACTION_FAILED", // Added for TX errors
+    TransactionFailed = "TRANSACTION_FAILED",
 }
 
 // --- Interfaces ---
@@ -62,7 +61,7 @@ export const cancelEventBooking = functions.https.onCall(
         // secrets: ["PAYMENT_GATEWAY_SECRET", "GOOGLE_API_CREDENTIALS"], // Example secrets
     },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[cancelEventBooking V2 - Permissions]"; // Updated version name
+        const functionName = "[cancelEventBooking V3 - GCal Helper]"; // Updated version name
         const startTimeFunc = Date.now();
 
         // 1. Authentication & Authorization
@@ -85,7 +84,7 @@ export const cancelEventBooking = functions.https.onCall(
         // --- Variables ---
         let bookingData: EventBooking;
         let userData: User;
-        let userRole: string | null; // Fetch role
+        let userRole: string | null;
         let voidResult: Awaited<ReturnType<typeof voidAuthorization>> | null = null;
         let refundResult: Awaited<ReturnType<typeof processRefund>> | null = null;
         let updatedPaymentStatus: PaymentStatus;
@@ -94,7 +93,7 @@ export const cancelEventBooking = functions.https.onCall(
 
         // --- Firestore References ---
         const bookingRef = db.collection('eventBookings').doc(bookingId);
-        const userRef = db.collection('users').doc(userId); // Needed for role check
+        const userRef = db.collection('users').doc(userId);
 
         try {
             // 3. Fetch User and Booking Data Concurrently
@@ -103,7 +102,7 @@ export const cancelEventBooking = functions.https.onCall(
             // Validate User
             if (!userSnap.exists) throw new HttpsError('not-found', `error.user.notFound::${userId}`, { errorCode: ErrorCode.UserNotFound });
             userData = userSnap.data() as User;
-            userRole = userData.role; // Get role
+            userRole = userData.role;
             logContext.userRole = userRole;
 
             // Validate Booking
@@ -117,11 +116,10 @@ export const cancelEventBooking = functions.https.onCall(
             logContext.bookingCustomerId = bookingData.customerId;
             logContext.googleCalendarEventId = bookingData.googleCalendarEventId;
 
-            // 4. Permission Check (Using REAL helper)
+            // 4. Permission Check
             const isOwner = userId === bookingData.customerId;
             const isAdmin = userRole === 'Admin' || userRole === 'SuperAdmin';
             const requiredPermission = isOwner ? 'event:cancel:own' : (isAdmin ? 'event:cancel:any' : 'permission_denied');
-            // Pass fetched role to checkPermission
             const hasPermission = await checkPermission(userId, userRole, requiredPermission, logContext);
 
             if (!hasPermission) {
@@ -131,15 +129,10 @@ export const cancelEventBooking = functions.https.onCall(
             }
 
             // 5. State Validation
-            // Allow cancellation from various pending/confirmed states, but not completed/already cancelled.
             const cancellableStatuses: string[] = [
-                EventBookingStatus.PendingAdminApproval,
-                EventBookingStatus.PendingCustomerConfirmation,
-                EventBookingStatus.Confirmed,
-                EventBookingStatus.Scheduled,
-                EventBookingStatus.Preparing, // Maybe allow cancelling before InProgress?
-                EventBookingStatus.Delayed,
-                EventBookingStatus.RequiresAdminAttention,
+                EventBookingStatus.PendingAdminApproval, EventBookingStatus.PendingCustomerConfirmation,
+                EventBookingStatus.Confirmed, EventBookingStatus.Scheduled, EventBookingStatus.Preparing,
+                EventBookingStatus.Delayed, EventBookingStatus.RequiresAdminAttention,
             ];
             if (!cancellableStatuses.includes(bookingData.bookingStatus)) {
                 logger.warn(`${functionName} Event booking ${bookingId} cannot be cancelled from status '${bookingData.bookingStatus}'.`, logContext);
@@ -150,88 +143,61 @@ export const cancelEventBooking = functions.https.onCall(
                   return { success: false, error: "error.event.alreadyCancelled", errorCode: ErrorCode.FailedPrecondition };
              }
 
-            // 6. Handle Payment Void/Refund (if applicable)
-            // This depends heavily on the payment flow (deposit vs full payment, timing)
-            // Let's assume payment happens at 'confirmEventAgreement' and is 'Paid' or 'ChargeFailed' by now.
+            // 6. Handle Payment Void/Refund (if applicable) - Logic remains the same as V2
             updatedPaymentStatus = bookingData.paymentStatus;
-
-            if (bookingData.paymentStatus === PaymentStatus.Paid || bookingData.paymentStatus === PaymentStatus.Captured) { // If payment was successful
-                 // --- Process Refund ---
-                 // Check cancellation policy - full refund? Partial? Fee?
-                 // For now, assume full refund of totalAmount. Add fee logic later.
-                 const transactionId = bookingData.paymentDetails?.transactionId; // Assuming charge ID is stored here
-                 const amountToRefund = bookingData.totalAmountSmallestUnit; // Refund full amount for now
-
+            if (bookingData.paymentStatus === PaymentStatus.Paid || bookingData.paymentStatus === PaymentStatus.Captured) {
+                 const transactionId = bookingData.paymentDetails?.transactionId;
+                 const amountToRefund = bookingData.totalAmountSmallestUnit;
                  if (!transactionId) {
-                      logger.error(`${functionName} Cannot refund payment for booking ${bookingId}: Missing transactionId in paymentDetails.`, logContext);
-                      // Don't fail the whole cancellation, but log and maybe flag for admin.
-                      updatedPaymentStatus = PaymentStatus.RefundFailed; // Mark as failed due to missing info
-                 } else if (amountToRefund == null || amountToRefund <= 0) {
-                      logger.warn(`${functionName} Booking ${bookingId}: No amount to refund (${amountToRefund}). Skipping refund process.`, logContext);
-                 } else {
-                     logger.info(`${functionName} Booking ${bookingId}: Payment is ${bookingData.paymentStatus}. Attempting to refund ${amountToRefund} ${bookingData.currencyCode} for transaction ${transactionId}...`, logContext);
-                     refundResult = await processRefund(
-                         transactionId,
-                         amountToRefund,
-                         bookingData.currencyCode,
-                         reason || (isOwner ? "customer_request" : "admin_cancellation"),
-                         bookingId
-                     );
-
-                     if (!refundResult.success) {
-                         updatedPaymentStatus = PaymentStatus.RefundFailed; // Mark as failed
-                         logger.error(`${functionName} Payment refund failed for booking ${bookingId}, TxID: ${transactionId}.`, { ...logContext, error: refundResult.errorMessage, code: refundResult.errorCode });
-                         // Still cancel the booking, but mark payment status.
-                     } else {
-                         updatedPaymentStatus = PaymentStatus.Refunded;
-                         logger.info(`${functionName} Payment refund successful for booking ${bookingId}, TxID: ${transactionId}, RefundID: ${refundResult.refundId}.`, logContext);
-                         refundDetails = {
-                             refundId: refundResult.refundId, refundTimestamp: refundResult.timestamp,
-                             refundAmountSmallestUnit: refundResult.amountRefunded, gatewayName: refundResult.gatewayName,
-                             reason: reason || (isOwner ? "customer_request" : "admin_cancellation"),
-                         };
+                      logger.error(`${functionName} Cannot refund payment for booking ${bookingId}: Missing transactionId.`, logContext);
+                      updatedPaymentStatus = PaymentStatus.RefundFailed;
+                 } else if (amountToRefund != null && amountToRefund > 0) {
+                     logger.info(`${functionName} Attempting to refund ${amountToRefund} ${bookingData.currencyCode} for transaction ${transactionId}...`, logContext);
+                     refundResult = await processRefund( transactionId, amountToRefund, bookingData.currencyCode, reason || (isOwner ? "customer_request" : "admin_cancellation"), bookingId );
+                     updatedPaymentStatus = refundResult.success ? PaymentStatus.Refunded : PaymentStatus.RefundFailed;
+                     if (!refundResult.success) logger.error(`${functionName} Payment refund failed.`, { ...logContext, error: refundResult.errorMessage });
+                     else {
+                         logger.info(`${functionName} Payment refund successful. RefundID: ${refundResult.refundId}.`, logContext);
+                         refundDetails = { refundId: refundResult.refundId, refundTimestamp: refundResult.timestamp, refundAmountSmallestUnit: refundResult.amountRefunded, gatewayName: refundResult.gatewayName, reason: reason || (isOwner ? "customer_request" : "admin_cancellation") };
                      }
                   }
             } else if (bookingData.paymentStatus === PaymentStatus.Authorized) {
-                 // If using auth/capture for events (less common), void the auth here.
-                 const authId = bookingData.paymentDetails?.authorizationId; // Assuming auth details are stored if used
+                 const authId = bookingData.paymentDetails?.authorizationId;
                  if (!authId) {
                       logger.error(`${functionName} Cannot void payment for booking ${bookingId}: Missing authorizationId.`, logContext);
                       updatedPaymentStatus = PaymentStatus.VoidFailed;
                  } else {
-                     logger.info(`${functionName} Booking ${bookingId}: Payment is Authorized. Attempting to void authorization ${authId}...`, logContext);
+                     logger.info(`${functionName} Attempting to void authorization ${authId}...`, logContext);
                      voidResult = await voidAuthorization(authId);
                      updatedPaymentStatus = voidResult.success ? PaymentStatus.Voided : PaymentStatus.VoidFailed;
                      if (!voidResult.success) logger.error(`${functionName} Payment void failed.`, { ...logContext, error: voidResult.errorMessage });
                      else logger.info(`${functionName} Payment void successful.`, logContext);
                  }
-            } else {
-                 logger.info(`${functionName} Booking ${bookingId}: No payment action required for cancellation based on current payment status '${bookingData.paymentStatus}'.`, logContext);
             }
             logContext.updatedPaymentStatus = updatedPaymentStatus;
 
-
-            // 7. Delete Google Calendar Event (if exists)
+            // 7. Delete Google Calendar Event (Using REAL Helper)
             if (bookingData.googleCalendarEventId) {
                  logger.info(`${functionName} Attempting to delete Google Calendar event: ${bookingData.googleCalendarEventId}`, logContext);
+                 // Call the helper function
                  const gcalResult = await deleteGoogleCalendarEvent(bookingData.googleCalendarEventId);
                  if (!gcalResult.success) {
                       logger.error(`${functionName} Failed to delete Google Calendar event ${bookingData.googleCalendarEventId}.`, { ...logContext, error: gcalResult.error });
                       gcalDeleteSuccess = false; // Mark failure but continue cancellation
-                      // Flag for manual check?
                  } else {
                       logger.info(`${functionName} Google Calendar event ${bookingData.googleCalendarEventId} deleted successfully.`, logContext);
                  }
+            } else {
+                logger.info(`${functionName} No Google Calendar event ID found for booking ${bookingId}. Skipping deletion.`, logContext);
             }
 
-            // 8. Firestore Transaction to Update Booking Status
+            // 8. Firestore Transaction to Update Booking Status - Logic remains the same as V2
             logger.info(`${functionName} Starting Firestore transaction to update booking status...`, logContext);
             await db.runTransaction(async (transaction) => {
                 const bookingTxSnap = await transaction.get(bookingRef);
                 if (!bookingTxSnap.exists) throw new Error(`TX_ERR::${ErrorCode.BookingNotFound}`);
                 const bookingTxData = bookingTxSnap.data() as EventBooking;
 
-                // Re-validate status
                 if (bookingTxData.bookingStatus === EventBookingStatus.Cancelled) {
                      logger.warn(`${functionName} TX Conflict: Booking ${bookingId} was already cancelled. Aborting update.`);
                      return;
@@ -241,32 +207,24 @@ export const cancelEventBooking = functions.https.onCall(
                      return;
                 }
 
-                // Prepare Booking Update
                 const now = Timestamp.now();
                 const updateData: { [key: string]: any } = {
                     bookingStatus: EventBookingStatus.Cancelled,
-                    paymentStatus: updatedPaymentStatus, // Update based on void/refund result
+                    paymentStatus: updatedPaymentStatus,
                     updatedAt: FieldValue.serverTimestamp(),
                     cancellationTimestamp: now,
                     cancelledBy: userId,
                     cancellationReason: reason || null,
                     statusChangeHistory: FieldValue.arrayUnion({
-                        from: bookingData.bookingStatus,
-                        to: EventBookingStatus.Cancelled,
-                        timestamp: now,
-                        userId: userId,
-                        role: userRole,
+                        from: bookingData.bookingStatus, to: EventBookingStatus.Cancelled, timestamp: now, userId: userId, role: userRole,
                         reason: `Cancelled by ${userRole ?? 'User'}${reason ? `: ${reason}` : ''}`
                     }),
-                    processingError: null, // Clear previous errors
+                    processingError: null,
                     needsManualGcalDelete: !gcalDeleteSuccess, // Flag if GCal delete failed
+                    googleCalendarEventId: gcalDeleteSuccess ? null : bookingData.googleCalendarEventId, // Clear GCal ID only if deletion succeeded
                 };
-                // Add refund details if applicable
-                if (refundDetails) {
-                    updateData.refundDetails = refundDetails;
-                }
-                // Add void/refund failure details?
-                 if (voidResult && !voidResult.success) {
+                if (refundDetails) updateData.refundDetails = refundDetails;
+                if (voidResult && !voidResult.success) {
                      updateData['paymentDetails.voidErrorCode'] = voidResult.errorCode;
                      updateData['paymentDetails.voidErrorMessage'] = voidResult.errorMessage;
                  }
@@ -274,14 +232,11 @@ export const cancelEventBooking = functions.https.onCall(
                       updateData['paymentDetails.refundErrorCode'] = refundResult.errorCode;
                       updateData['paymentDetails.refundErrorMessage'] = refundResult.errorMessage;
                  }
-
-                // Perform Write
                 transaction.update(bookingRef, updateData);
-            }); // End Transaction
+            });
             logger.info(`${functionName} Event booking ${bookingId} status updated to Cancelled successfully.`, logContext);
 
-
-            // 9. Log Action (Async)
+            // 9. Log Action (Async) - Logic remains the same as V2
             const logDetails = { bookingId, customerId: bookingData.customerId, cancelledBy: userId, userRole, reason, initialStatus: bookingData.bookingStatus, finalPaymentStatus: updatedPaymentStatus, gcalDeleteSuccess };
             if (isAdmin) {
                 logAdminAction("CancelEventBooking", logDetails).catch(err => logger.error("Failed logging admin action", { err }));
@@ -289,11 +244,11 @@ export const cancelEventBooking = functions.https.onCall(
                 logUserActivity("CancelEventBooking", logDetails, userId).catch(err => logger.error("Failed logging user activity", { err }));
             }
 
-            // 10. Return Success
+            // 10. Return Success - Logic remains the same as V2
             return { success: true };
 
         } catch (error: any) {
-            // Error Handling
+            // Error Handling - Logic remains the same as V2
             logger.error(`${functionName} Execution failed.`, { ...logContext, error: error?.message, details: error?.details });
             const isHttpsError = error instanceof HttpsError;
             let finalErrorCode: ErrorCode = ErrorCode.InternalError;
