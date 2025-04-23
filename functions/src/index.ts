@@ -14,7 +14,7 @@ if (admin.apps.length === 0) {
 import { createOrder } from './core/createOrder';
 import { updateOrderStatus } from './core/updateOrderStatus';
 import { cancelOrder } from './core/cancelOrder';
-import { handleOrderCancellationSideEffects } from './core/handleOrderCancellationSideEffects'; // <-- שורה חדשה (רק import)
+import { handleOrderCancellationSideEffects } from './core/handleOrderCancellationSideEffects'; // Background
 
 // --- Import Rentals Functions ---
 import { getAvailableRentalItems } from './rentals/getAvailableRentalItems';
@@ -42,6 +42,7 @@ import { listPermissions, assignRoleToUser } from './rbac/managePermissionsUsers
 
 // --- Import Admin Functions ---
 import { setUserActiveStatus, adjustBoxInventory } from './admin/manageUsersInventory';
+import { createPromoCode, updatePromoCode, deletePromoCode, listPromoCodes } from './admin/managePromoCodes'; // <-- שורה חדשה
 
 // --- Import Scheduled Functions ---
 import { autoCancelExpiredOrders, deactivateExpiredPromotions, cleanupOldLogs } from './scheduled/scheduledFunctions'; // Background
@@ -88,6 +89,10 @@ export {
   // Admin
   setUserActiveStatus,
   adjustBoxInventory,
+  createPromoCode, // <-- שורה חדשה
+  updatePromoCode, // <-- שורה חדשה
+  deletePromoCode, // <-- שורה חדשה
+  listPromoCodes, // <-- שורה חדשה
   // Auth
   sendOtp,
   verifyOtp,
@@ -104,7 +109,7 @@ createGoogleCalendarEvent;
 autoCancelExpiredOrders;
 deactivateExpiredPromotions;
 cleanupOldLogs;
-handleOrderCancellationSideEffects; // <-- שורה חדשה
+handleOrderCancellationSideEffects;
 // Note: Utility functions like logUserActivity don't need to be referenced here
 // as they are imported and used by other functions.
 // ... add references for other background/triggered functions ...
