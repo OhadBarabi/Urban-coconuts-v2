@@ -7,12 +7,8 @@ import { HttpsError } from "firebase-functions/v2/https";
 import { User, Box } from '../models'; // Adjust path if needed
 
 // --- Import Helpers ---
-import { checkPermission } from '../utils/permissions'; // <-- Import REAL helper
-// import { logAdminAction } from '../utils/logging'; // Using mock below
-
-// --- Mocks for other required helper functions (Replace with actual implementations) ---
-async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); }
-// --- End Mocks ---
+import { checkPermission } from '../utils/permissions';
+import { logAdminAction } from '../utils/logging'; // Using mock from manageRoles for now
 
 // --- Configuration ---
 // Ensure Firebase Admin is initialized (moved to index.ts)
@@ -31,6 +27,7 @@ enum ErrorCode {
     BoxNotFound = "BOX_NOT_FOUND",
     InvalidAdjustmentFormat = "INVALID_ADJUSTMENT_FORMAT",
     TransactionFailed = "TRANSACTION_FAILED",
+    ResourceExhausted = "RESOURCE_EXHAUSTED", // Added for negative stock check
 }
 
 // --- Interfaces ---
@@ -56,7 +53,7 @@ interface AdjustBoxInventoryInput {
 export const setUserActiveStatus = functions.https.onCall(
     { region: FUNCTION_REGION, memory: "128MiB" },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[setUserActiveStatus V2 - Permissions]"; // Updated version name
+        const functionName = "[setUserActiveStatus V2 - Permissions]";
         const startTimeFunc = Date.now();
 
         // 1. Authentication & Authorization
@@ -67,7 +64,6 @@ export const setUserActiveStatus = functions.https.onCall(
 
         logger.info(`${functionName} Invoked.`, logContext);
 
-        // Fetch admin user role for permission check
         let adminUserRole: string | null = null;
         try {
             const adminUserSnap = await db.collection('users').doc(adminUserId).get();
@@ -75,7 +71,6 @@ export const setUserActiveStatus = functions.https.onCall(
             adminUserRole = (adminUserSnap.data() as User)?.role;
             logContext.adminUserRole = adminUserRole;
 
-            // Permission Check (Using REAL helper) - Define permission: 'admin:user:setActiveStatus'
             const hasPermission = await checkPermission(adminUserId, adminUserRole, 'admin:user:setActiveStatus', logContext);
             if (!hasPermission) {
                 logger.warn(`${functionName} Permission denied for admin ${adminUserId} (Role: ${adminUserRole}) to set user active status.`, logContext);
@@ -95,7 +90,6 @@ export const setUserActiveStatus = functions.https.onCall(
         }
         const { userId: targetUserId, isActive: targetIsActive } = data;
 
-        // Prevent admin from deactivating themselves? (Optional safeguard)
         if (targetUserId === adminUserId && !targetIsActive) {
              logger.warn(`${functionName} Admin user ${adminUserId} attempted to deactivate themselves. Denied.`, logContext);
              return { success: false, error: "error.setUserActive.cannotDeactivateSelf", errorCode: ErrorCode.PermissionDenied };
@@ -104,7 +98,6 @@ export const setUserActiveStatus = functions.https.onCall(
         // 3. Update Target User Document
         const targetUserRef = db.collection('users').doc(targetUserId);
         try {
-            // Check if user exists before updating
             const targetUserSnap = await targetUserRef.get();
             if (!targetUserSnap.exists) {
                  logger.warn(`${functionName} Target user ${targetUserId} not found.`, logContext);
@@ -118,14 +111,14 @@ export const setUserActiveStatus = functions.https.onCall(
             logger.info(`${functionName} Active status for user '${targetUserId}' set to ${targetIsActive}.`, logContext);
 
             // 4. Log Admin Action (Async)
-            logAdminAction("SetUserActiveStatus", { targetUserId, targetIsActive, triggerUserId: adminUserId }).catch(err => logger.error("Failed logging admin action", { err }));
+            logAdminAction("SetUserActiveStatus", { targetUserId, targetIsActive, triggerUserId: adminUserId })
+                .catch(err => logger.error("Failed logging SetUserActiveStatus admin action", { err })); // Fixed catch
 
             // 5. Return Success
             return { success: true };
 
         } catch (error: any) {
             logger.error(`${functionName} Failed to set active status for user '${targetUserId}'.`, { ...logContext, error: error.message });
-            // Handle potential update errors
             return { success: false, error: "error.internalServer", errorCode: ErrorCode.InternalError };
         } finally {
             logger.info(`${functionName} Execution finished. Duration: ${Date.now() - startTimeFunc}ms`, logContext);
@@ -138,9 +131,9 @@ export const setUserActiveStatus = functions.https.onCall(
 // === Adjust Box Inventory Function ==========================================
 // ============================================================================
 export const adjustBoxInventory = functions.https.onCall(
-    { region: FUNCTION_REGION, memory: "256MiB" }, // May need more memory if adjustments array is large
+    { region: FUNCTION_REGION, memory: "256MiB" },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[adjustBoxInventory V2 - Permissions]"; // Updated version name
+        const functionName = "[adjustBoxInventory V2 - Permissions]";
         const startTimeFunc = Date.now();
 
         // 1. Authentication & Authorization
@@ -151,7 +144,6 @@ export const adjustBoxInventory = functions.https.onCall(
 
         logger.info(`${functionName} Invoked.`, logContext);
 
-        // Fetch admin user role for permission check
         let adminUserRole: string | null = null;
         try {
             const adminUserSnap = await db.collection('users').doc(adminUserId).get();
@@ -159,7 +151,6 @@ export const adjustBoxInventory = functions.https.onCall(
             adminUserRole = (adminUserSnap.data() as User)?.role;
             logContext.adminUserRole = adminUserRole;
 
-            // Permission Check (Using REAL helper) - Define permission: 'admin:inventory:adjust'
             const hasPermission = await checkPermission(adminUserId, adminUserRole, 'admin:inventory:adjust', logContext);
             if (!hasPermission) {
                 logger.warn(`${functionName} Permission denied for admin ${adminUserId} (Role: ${adminUserRole}) to adjust inventory.`, logContext);
@@ -206,27 +197,20 @@ export const adjustBoxInventory = functions.https.onCall(
                     const currentStock = currentInventory[productId] ?? 0;
                     const newStock = currentStock + change;
 
-                    // Prevent stock from going below zero due to adjustment
                     if (newStock < 0) {
-                        logger.error(`${functionName} TX Check: Adjustment for product ${productId} would result in negative stock (${newStock}). Current: ${currentStock}, Change: ${change}.`, logContext);
-                        // Option 1: Throw error and fail transaction
                         throw new Error(`TX_ERR::${ErrorCode.ResourceExhausted}::${productId}`);
-                        // Option 2: Adjust only down to zero? inventoryUpdates[`inventory.${productId}`] = 0;
                     }
                     inventoryUpdates[`inventory.${productId}`] = FieldValue.increment(change);
                 }
 
-                // Add timestamp to the update
                 inventoryUpdates.updatedAt = FieldValue.serverTimestamp();
-
-                // Perform Write
                 transaction.update(boxRef, inventoryUpdates);
-            }); // End Transaction
+            });
             logger.info(`${functionName} Inventory for box '${boxId}' adjusted successfully.`, logContext);
 
             // 4. Log Admin Action (Async)
-            // Consider logging each adjustment individually or summarizing
-            logAdminAction("AdjustBoxInventory", { boxId, reason, adjustments, triggerUserId: adminUserId }).catch(err => logger.error("Failed logging admin action", { err }));
+            logAdminAction("AdjustBoxInventory", { boxId, reason, adjustments, triggerUserId: adminUserId })
+                .catch(err => logger.error("Failed logging AdjustBoxInventory admin action", { err })); // Fixed catch
 
             // 5. Return Success
             return { success: true };
@@ -241,10 +225,12 @@ export const adjustBoxInventory = functions.https.onCall(
                  const txErrCode = parts[1] as ErrorCode;
                  finalErrorCode = Object.values(ErrorCode).includes(txErrCode) ? txErrCode : ErrorCode.TransactionFailed;
                  finalErrorMessageKey = `error.transaction.${finalErrorCode.toLowerCase()}`;
-                 if (parts[2]) finalErrorMessageKey += `::${parts[2]}`; // e.g., error.transaction.resourceexhausted::productId
+                 if (parts[2]) finalErrorMessageKey += `::${parts[2]}`;
             }
 
-            logAdminAction("AdjustBoxInventoryFailed", { boxId, reason, adjustments, error: error.message, triggerUserId: adminUserId }).catch(...)
+            // Log failure action
+            logAdminAction("AdjustBoxInventoryFailed", { boxId, reason, adjustments, error: error.message, triggerUserId: adminUserId })
+                .catch(err => logger.error("Failed logging AdjustBoxInventoryFailed admin action", { err })); // Fixed catch
 
             return { success: false, error: finalErrorMessageKey, errorCode: finalErrorCode };
         } finally {
