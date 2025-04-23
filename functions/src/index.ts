@@ -13,7 +13,8 @@ if (admin.apps.length === 0) {
 // --- Import Core Functions ---
 import { createOrder } from './core/createOrder';
 import { updateOrderStatus } from './core/updateOrderStatus';
-import { cancelOrder } from './core/cancelOrder'; // <-- שורה חדשה
+import { cancelOrder } from './core/cancelOrder';
+import { handleOrderCancellationSideEffects } from './core/handleOrderCancellationSideEffects'; // <-- שורה חדשה (רק import)
 
 // --- Import Rentals Functions ---
 import { getAvailableRentalItems } from './rentals/getAvailableRentalItems';
@@ -60,7 +61,7 @@ export {
   // Core
   createOrder,
   updateOrderStatus,
-  cancelOrder, // <-- שורה חדשה
+  cancelOrder,
   // Rentals
   getAvailableRentalItems,
   createRentalBooking,
@@ -103,6 +104,7 @@ createGoogleCalendarEvent;
 autoCancelExpiredOrders;
 deactivateExpiredPromotions;
 cleanupOldLogs;
+handleOrderCancellationSideEffects; // <-- שורה חדשה
 // Note: Utility functions like logUserActivity don't need to be referenced here
 // as they are imported and used by other functions.
 // ... add references for other background/triggered functions ...
