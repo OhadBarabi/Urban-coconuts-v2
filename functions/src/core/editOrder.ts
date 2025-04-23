@@ -9,13 +9,12 @@ import {
     User, Order, OrderStatus, OrderItem, Product, Box, PaymentStatus
 } from '../models'; // Adjust path if needed
 
-// --- Assuming helper functions are imported or defined elsewhere ---
-// import { checkPermission } from '../utils/permissions';
-// import { calculateOrderTotal } from '../utils/order_calculations'; // Re-use calculation logic
-// import { logUserActivity, logAdminAction } from '../utils/logging';
+// --- Import Helpers ---
+import { checkPermission } from '../utils/permissions'; // <-- Import REAL helper
+// import { calculateOrderTotal } from '../utils/order_calculations'; // Still using mock below
+// import { logUserActivity, logAdminAction } from '../utils/logging'; // Still using mocks below
 
-// --- Mocks for required helper functions (Replace with actual implementations) ---
-async function checkPermission(userId: string | null, userRole: string | null, permissionId: string, context?: any): Promise<boolean> { logger.info(`[Mock Auth] Check ${permissionId} for ${userId} (${userRole})`, context); return userId != null; }
+// --- Mocks for other required helper functions (Replace with actual implementations) ---
 interface CalculationResult { totalAmount: number; itemsTotal: number; couponDiscount: number; ucCoinDiscount: number; finalAmount: number; error?: string; }
 function calculateOrderTotal(items: Array<{ productId: string; quantity: number; unitPrice: number }>, coupon?: any | null, ucCoinsToUse?: number | null, userCoinBalance?: number, tipAmount?: number): CalculationResult { logger.info(`[Mock Calc] Recalculating total for edit...`); const itemsTotal = items.reduce((sum, item) => sum + (item.unitPrice * item.quantity), 0); const couponDiscount = coupon ? 500 : 0; const ucCoinDiscount = Math.min(ucCoinsToUse ?? 0, userCoinBalance ?? 0); const finalAmount = itemsTotal - couponDiscount - ucCoinDiscount + (tipAmount ?? 0); return { totalAmount: itemsTotal, itemsTotal, couponDiscount, ucCoinDiscount, finalAmount }; }
 async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); }
@@ -38,7 +37,8 @@ enum ErrorCode {
     InternalError = "INTERNAL_ERROR",
     // Specific codes
     OrderNotFound = "ORDER_NOT_FOUND",
-    NotOrderOwner = "NOT_ORDER_OWNER", // If only owner can edit
+    UserNotFound = "USER_NOT_FOUND", // Added
+    NotOrderOwnerOrAdmin = "NOT_ORDER_OWNER_OR_ADMIN", // Adjusted permission logic
     InvalidOrderStatus = "INVALID_ORDER_STATUS", // Not editable from this state
     ProductNotFound = "PRODUCT_NOT_FOUND",
     ProductInactive = "PRODUCT_INACTIVE",
@@ -67,7 +67,7 @@ export const editOrder = functions.https.onCall(
         timeoutSeconds: 60,
     },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[editOrder V1]";
+        const functionName = "[editOrder V2 - Permissions]";
         const startTimeFunc = Date.now();
 
         // 1. Authentication & Authorization
@@ -92,14 +92,14 @@ export const editOrder = functions.https.onCall(
         // --- Variables ---
         let orderData: Order;
         let userData: User; // Needed for recalculation if UC Coins/Coupons involved
-        let userRole: string | null;
+        let userRole: string | null; // Fetch user role
         let boxData: Box; // Needed for inventory check
         let fetchedProducts = new Map<string, Product>(); // Map product IDs to product data
         let newOrderItems: OrderItem[] = [];
         let calculationResult: CalculationResult;
 
         try {
-            // 3. Fetch User Role, Order, and Box Data Concurrently
+            // 3. Fetch User, Order, and Box Data Concurrently
             const userRef = db.collection('users').doc(userId);
             const orderRef = db.collection('orders').doc(orderId);
 
@@ -108,7 +108,7 @@ export const editOrder = functions.https.onCall(
             // Validate User
             if (!userSnap.exists) throw new HttpsError('not-found', `error.user.notFound::${userId}`, { errorCode: ErrorCode.UserNotFound });
             userData = userSnap.data() as User;
-            userRole = userData.role;
+            userRole = userData.role; // Get role
             logContext.userRole = userRole;
 
             // Validate Order
@@ -128,32 +128,32 @@ export const editOrder = functions.https.onCall(
             if (!boxSnap.exists) throw new HttpsError('not-found', `error.box.notFound::${orderData.boxId}`, { errorCode: ErrorCode.BoxNotFound });
             boxData = boxSnap.data() as Box;
 
-            // 4. Permission Check (Allow owner or admin?)
+            // 4. Permission Check (Using REAL helper)
             const isOwner = userId === orderData.customerId;
+            const isAdmin = userRole === 'Admin' || userRole === 'SuperAdmin';
             // Define permissions needed: e.g., 'order:edit:own', 'order:edit:any'
-            const requiredPermission = isOwner ? 'order:edit:own' : 'order:edit:any';
-            const hasPermission = await checkPermission(userId, userRole, requiredPermission, { orderId });
+            const requiredPermission = isOwner ? 'order:edit:own' : (isAdmin ? 'order:edit:any' : 'permission_denied');
+            // Pass fetched role to checkPermission
+            const hasPermission = await checkPermission(userId, userRole, requiredPermission, logContext);
             if (!hasPermission) {
                 logger.warn(`${functionName} Permission denied for user ${userId} (Role: ${userRole}) to edit order ${orderId}.`, logContext);
-                return { success: false, error: "error.permissionDenied.editOrder", errorCode: ErrorCode.PermissionDenied };
+                const errorCode = (requiredPermission === 'permission_denied') ? ErrorCode.PermissionDenied : ErrorCode.NotOrderOwnerOrAdmin;
+                return { success: false, error: "error.permissionDenied.editOrder", errorCode: errorCode };
             }
 
-            // 5. State Validation (Allow editing only in specific states, e.g., 'Red')
-            // More complex logic might allow edits in 'Yellow' before preparation starts.
+            // 5. State Validation
             const editableStatuses: string[] = [OrderStatus.Red.toString()];
             if (!editableStatuses.includes(orderData.status)) {
                 logger.warn(`${functionName} Order ${orderId} cannot be edited from status '${orderData.status}'.`, logContext);
                 return { success: false, error: `error.order.invalidStatus.edit::${orderData.status}`, errorCode: ErrorCode.InvalidOrderStatus };
             }
-            // Also check payment status - cannot edit if already Paid/Captured/etc.?
             const nonEditablePaymentStatuses: string[] = [PaymentStatus.Paid.toString(), PaymentStatus.Captured.toString(), PaymentStatus.Refunded.toString(), PaymentStatus.PartiallyRefunded.toString()];
             if (nonEditablePaymentStatuses.includes(orderData.paymentStatus)) {
                  logger.warn(`${functionName} Order ${orderId} cannot be edited due to payment status '${orderData.paymentStatus}'.`, logContext);
                  return { success: false, error: `error.order.invalidPaymentStatus.edit::${orderData.paymentStatus}`, errorCode: ErrorCode.InvalidOrderStatus };
             }
 
-
-            // 6. Fetch Product Data for all involved items (original and new)
+            // 6. Fetch Product Data for all involved items
             const originalProductIds = orderData.items.map(item => item.productId);
             const updatedProductIds = updatedItems.map(item => item.productId);
             const allProductIds = [...new Set([...originalProductIds, ...updatedProductIds])];
@@ -165,24 +165,12 @@ export const editOrder = functions.https.onCall(
             productDocs.forEach(doc => {
                 if (doc.exists) {
                     const product = doc.data() as Product;
-                    if (!product.isActive) {
-                        // If an item being ADDED is inactive, throw error
-                        if (updatedProductIds.includes(doc.id)) {
-                             logger.error(`${functionName} Cannot add inactive product ${doc.id} to order.`, logContext);
-                             throw new HttpsError('failed-precondition', `error.product.inactive::${doc.id}`, { errorCode: ErrorCode.ProductInactive });
-                        }
-                        // If an item being kept/removed was already inactive, maybe just log a warning?
-                        // logger.warn(`${functionName} Product ${doc.id} in order is inactive, but allowing edit.`);
+                    if (!product.isActive && updatedProductIds.includes(doc.id)) {
+                         throw new HttpsError('failed-precondition', `error.product.inactive::${doc.id}`, { errorCode: ErrorCode.ProductInactive });
                     }
                     fetchedProducts.set(doc.id, product);
-                } else {
-                    // If an item being ADDED is not found, throw error
-                    if (updatedProductIds.includes(doc.id)) {
-                         logger.error(`${functionName} Product ${doc.id} not found. Cannot add to order.`, logContext);
-                         throw new HttpsError('not-found', `error.product.notFound::${doc.id}`, { errorCode: ErrorCode.ProductNotFound });
-                    }
-                    // If an item being removed was not found, log warning but allow edit
-                    // logger.warn(`${functionName} Product ${doc.id} from original order not found.`);
+                } else if (updatedProductIds.includes(doc.id)) {
+                     throw new HttpsError('not-found', `error.product.notFound::${doc.id}`, { errorCode: ErrorCode.ProductNotFound });
                 }
             });
 
@@ -191,23 +179,22 @@ export const editOrder = functions.https.onCall(
                 const product = fetchedProducts.get(newItem.productId);
                 if (!product) throw new HttpsError('internal', `Internal error: Product ${newItem.productId} not found in fetched map during item creation.`);
                 return {
-                    orderItemId: uuidv4(), // Generate new IDs for all items in the edited order
+                    orderItemId: uuidv4(),
                     productId: newItem.productId,
-                    productName: product.productName_i18n?.['en'] ?? 'Unknown Product', // Snapshot name
+                    productName: product.productName_i18n?.[userData.preferredLanguage || 'en'] ?? product.productName_i18n?.['en'] ?? 'Unknown Product',
                     quantity: newItem.quantity,
-                    unitPrice: product.priceSmallestUnit, // Snapshot price
+                    unitPrice: product.priceSmallestUnit,
                 };
             });
 
             // 7. Recalculate Order Totals
-            // Use the existing coupon/UC coins from the original order for recalculation
             logger.info(`${functionName} Recalculating order totals...`, logContext);
             calculationResult = calculateOrderTotal(
                 newOrderItems,
-                orderData.couponCodeUsed ? { couponCode: orderData.couponCodeUsed } : null, // Pass minimal coupon info if used
+                orderData.couponCodeUsed ? { couponCode: orderData.couponCodeUsed } : null,
                 orderData.ucCoinsUsed,
-                userData.ucCoinBalance, // Pass current balance for validation if needed by calculator
-                orderData.tipAmountSmallestUnit // Keep existing tip
+                userData.ucCoinBalance,
+                orderData.tipAmountSmallestUnit
             );
             if (calculationResult.error) {
                 throw new HttpsError('internal', `error.internal.calculation::${calculationResult.error}`, { errorCode: ErrorCode.CalculationError });
@@ -216,11 +203,9 @@ export const editOrder = functions.https.onCall(
             logContext.newTotalAmount = newItemsTotal;
             logContext.newFinalAmount = newFinalAmount;
 
-
             // 8. Firestore Transaction
             logger.info(`${functionName} Starting Firestore transaction for order edit...`, logContext);
             await db.runTransaction(async (transaction) => {
-                // Re-read order and box data
                 const orderTxSnap = await transaction.get(orderRef);
                 const boxTxSnap = await transaction.get(boxRef);
 
@@ -229,14 +214,13 @@ export const editOrder = functions.https.onCall(
                 const orderTxData = orderTxSnap.data() as Order;
                 const boxTxData = boxTxSnap.data() as Box;
 
-                // Re-validate status
                 if (!editableStatuses.includes(orderTxData.status)) {
                      logger.warn(`${functionName} TX Conflict: Order ${orderId} status changed to ${orderTxData.status} during TX. Aborting edit.`, logContext);
-                     return; // Abort gracefully
+                     return;
                 }
                  if (nonEditablePaymentStatuses.includes(orderTxData.paymentStatus)) {
                      logger.warn(`${functionName} TX Conflict: Order ${orderId} payment status changed to ${orderTxData.paymentStatus} during TX. Aborting edit.`, logContext);
-                     return; // Abort gracefully
+                     return;
                  }
 
                 // Calculate Inventory Changes
@@ -245,58 +229,49 @@ export const editOrder = functions.https.onCall(
                 const originalItemMap = new Map<string, number>(orderTxData.items.map(item => [item.productId, item.quantity]));
                 const newItemMap = new Map<string, number>(newOrderItems.map(item => [item.productId, item.quantity]));
 
-                // Iterate through all unique products involved
                 allProductIds.forEach(productId => {
                     const originalQty = originalItemMap.get(productId) ?? 0;
                     const newQty = newItemMap.get(productId) ?? 0;
-                    const change = newQty - originalQty; // Positive if added/increased, negative if removed/decreased
+                    const change = newQty - originalQty;
 
                     if (change !== 0) {
                         const currentStock = currentInventory[productId] ?? 0;
-                        const stockAfterChange = currentStock - change; // Subtract the *change* (if change is negative, stock increases)
-
-                        // Check if adjustment leads to negative stock ONLY if we are increasing the quantity (change > 0)
+                        const stockAfterChange = currentStock - change;
                         if (change > 0 && stockAfterChange < 0) {
-                            logger.error(`${functionName} TX Check: Insufficient inventory for product ${productId}. Available: ${currentStock}, Needed change: ${change}.`, logContext);
                             throw new Error(`TX_ERR::${ErrorCode.InventoryUnavailable}::${productId}`);
                         }
-                        inventoryUpdates[`inventory.${productId}`] = FieldValue.increment(-change); // Increment by negative change to adjust stock
+                        inventoryUpdates[`inventory.${productId}`] = FieldValue.increment(-change);
                     }
                 });
 
                 // Prepare Order Update
                 const now = Timestamp.now();
                 const updateData: { [key: string]: any } = {
-                    items: newOrderItems, // Replace with the new item list
-                    totalAmount: newItemsTotal, // Update calculated total
-                    finalAmount: newFinalAmount, // Update calculated final amount
-                    notes: updatedNotes === undefined ? orderTxData.notes : (updatedNotes ?? null), // Update notes only if provided
+                    items: newOrderItems,
+                    totalAmount: newItemsTotal,
+                    finalAmount: newFinalAmount,
+                    notes: updatedNotes === undefined ? orderTxData.notes : (updatedNotes ?? null),
                     updatedAt: FieldValue.serverTimestamp(),
                     statusHistory: FieldValue.arrayUnion({
-                        // Use a specific status/reason for edit? Or just rely on log?
-                        // status: orderTxData.status, // Keep current status
                         timestamp: now,
                         userId: userId,
                         role: userRole,
                         reason: `Order edited by ${userRole ?? 'User'}`
                     }),
-                     processingError: null, // Clear previous errors
+                     processingError: null,
                 };
 
-                // --- Perform Writes ---
-                // 1. Update Order Document
+                // Perform Writes
                 transaction.update(orderRef, updateData);
-                // 2. Update Box Inventory (if changes occurred)
                 if (Object.keys(inventoryUpdates).length > 0) {
                     transaction.update(boxRef, inventoryUpdates);
                 }
-            }); // End Transaction
+            });
             logger.info(`${functionName} Order ${orderId} edited successfully.`, logContext);
-
 
             // 9. Log Action (Async)
             const logDetails = { orderId, customerId: orderData.customerId, oldItemCount: orderData.items.length, newItemCount: newOrderItems.length, oldFinalAmount: orderData.finalAmount, newFinalAmount, notesChanged: updatedNotes !== undefined, triggerUserId: userId, triggerUserRole: userRole };
-            if (userRole === 'Admin' || userRole === 'SuperAdmin') {
+            if (isAdmin) {
                 logAdminAction("EditOrder", logDetails).catch(err => logger.error("Failed logging admin action", { err }));
             } else {
                 logUserActivity("EditOrder", logDetails, userId).catch(err => logger.error("Failed logging user activity", { err }));
@@ -309,14 +284,13 @@ export const editOrder = functions.https.onCall(
             // Error Handling
             logger.error(`${functionName} Execution failed.`, { ...logContext, error: error?.message, details: error?.details });
             const isHttpsError = error instanceof HttpsError;
-            const code = isHttpsError ? error.code : 'UNKNOWN';
             let finalErrorCode: ErrorCode = ErrorCode.InternalError;
             let finalErrorMessageKey: string = "error.internalServer";
 
             if (isHttpsError) {
                 finalErrorCode = (error.details as any)?.errorCode as ErrorCode || ErrorCode.InternalError;
                 finalErrorMessageKey = error.message.startsWith("error.") ? error.message : `error.editOrder.generic`;
-                if (!Object.values(ErrorCode).includes(finalErrorCode)) finalErrorCode = ErrorCode.InternalError;
+                 if (!Object.values(ErrorCode).includes(finalErrorCode)) finalErrorCode = ErrorCode.InternalError;
                  if (error.message.includes("::")) { finalErrorMessageKey = error.message; }
             } else if (error.message?.startsWith("TX_ERR::")) {
                  const parts = error.message.split('::');
@@ -326,7 +300,6 @@ export const editOrder = functions.https.onCall(
                  if (parts[2]) finalErrorMessageKey += `::${parts[2]}`;
             }
 
-            // Log failure activity?
             logUserActivity("EditOrderFailed", { orderId, error: error.message }, userId).catch(...)
 
             return { success: false, error: finalErrorMessageKey, errorCode: finalErrorCode };
