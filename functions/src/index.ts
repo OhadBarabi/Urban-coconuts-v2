@@ -13,6 +13,7 @@ if (admin.apps.length === 0) {
 // --- Import Core Functions ---
 import { createOrder } from './core/createOrder';
 import { updateOrderStatus } from './core/updateOrderStatus';
+import { cancelOrder } from './core/cancelOrder'; // <-- שורה חדשה
 
 // --- Import Rentals Functions ---
 import { getAvailableRentalItems } from './rentals/getAvailableRentalItems';
@@ -47,7 +48,7 @@ import { autoCancelExpiredOrders, deactivateExpiredPromotions, cleanupOldLogs } 
 // --- Import Auth Functions ---
 import { sendOtp } from './auth/sendOtp';
 import { verifyOtp } from './auth/verifyOtp';
-import { generateMfaSetup, verifyMfaSetup, disableMfa, verifyMfaLogin } from './auth/manageMfa'; // <-- עדכון שורה זו
+import { generateMfaSetup, verifyMfaSetup, disableMfa, verifyMfaLogin } from './auth/manageMfa';
 
 // --- Import Utility Functions (Helpers are usually not Cloud Functions themselves) ---
 import { logUserActivity } from './utils/logging';
@@ -59,6 +60,7 @@ export {
   // Core
   createOrder,
   updateOrderStatus,
+  cancelOrder, // <-- שורה חדשה
   // Rentals
   getAvailableRentalItems,
   createRentalBooking,
@@ -91,7 +93,7 @@ export {
   generateMfaSetup,
   verifyMfaSetup,
   disableMfa,
-  verifyMfaLogin, // <-- שורה חדשה
+  verifyMfaLogin,
   // ... export other callable functions ...
 };
 
