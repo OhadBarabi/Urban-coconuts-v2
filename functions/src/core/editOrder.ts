@@ -37,8 +37,8 @@ enum ErrorCode {
     InternalError = "INTERNAL_ERROR",
     // Specific codes
     OrderNotFound = "ORDER_NOT_FOUND",
-    UserNotFound = "USER_NOT_FOUND", // Added
-    NotOrderOwnerOrAdmin = "NOT_ORDER_OWNER_OR_ADMIN", // Adjusted permission logic
+    UserNotFound = "USER_NOT_FOUND",
+    NotOrderOwnerOrAdmin = "NOT_ORDER_OWNER_OR_ADMIN",
     InvalidOrderStatus = "INVALID_ORDER_STATUS", // Not editable from this state
     ProductNotFound = "PRODUCT_NOT_FOUND",
     ProductInactive = "PRODUCT_INACTIVE",
@@ -67,7 +67,7 @@ export const editOrder = functions.https.onCall(
         timeoutSeconds: 60,
     },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[editOrder V2 - Permissions]";
+        const functionName = "[editOrder V2 - Permissions]"; // Updated version name
         const startTimeFunc = Date.now();
 
         // 1. Authentication & Authorization
@@ -141,7 +141,7 @@ export const editOrder = functions.https.onCall(
                 return { success: false, error: "error.permissionDenied.editOrder", errorCode: errorCode };
             }
 
-            // 5. State Validation
+            // 5. State Validation - Logic remains the same as V1
             const editableStatuses: string[] = [OrderStatus.Red.toString()];
             if (!editableStatuses.includes(orderData.status)) {
                 logger.warn(`${functionName} Order ${orderId} cannot be edited from status '${orderData.status}'.`, logContext);
@@ -153,7 +153,7 @@ export const editOrder = functions.https.onCall(
                  return { success: false, error: `error.order.invalidPaymentStatus.edit::${orderData.paymentStatus}`, errorCode: ErrorCode.InvalidOrderStatus };
             }
 
-            // 6. Fetch Product Data for all involved items
+            // 6. Fetch Product Data for all involved items - Logic remains the same as V1
             const originalProductIds = orderData.items.map(item => item.productId);
             const updatedProductIds = updatedItems.map(item => item.productId);
             const allProductIds = [...new Set([...originalProductIds, ...updatedProductIds])];
@@ -174,7 +174,7 @@ export const editOrder = functions.https.onCall(
                 }
             });
 
-            // Build the new list of OrderItems with snapshots
+            // Build the new list of OrderItems with snapshots - Logic remains the same as V1
             newOrderItems = updatedItems.map(newItem => {
                 const product = fetchedProducts.get(newItem.productId);
                 if (!product) throw new HttpsError('internal', `Internal error: Product ${newItem.productId} not found in fetched map during item creation.`);
@@ -187,7 +187,7 @@ export const editOrder = functions.https.onCall(
                 };
             });
 
-            // 7. Recalculate Order Totals
+            // 7. Recalculate Order Totals - Logic remains the same as V1
             logger.info(`${functionName} Recalculating order totals...`, logContext);
             calculationResult = calculateOrderTotal(
                 newOrderItems,
@@ -203,7 +203,7 @@ export const editOrder = functions.https.onCall(
             logContext.newTotalAmount = newItemsTotal;
             logContext.newFinalAmount = newFinalAmount;
 
-            // 8. Firestore Transaction
+            // 8. Firestore Transaction - Logic remains the same as V1
             logger.info(`${functionName} Starting Firestore transaction for order edit...`, logContext);
             await db.runTransaction(async (transaction) => {
                 const orderTxSnap = await transaction.get(orderRef);
@@ -269,7 +269,7 @@ export const editOrder = functions.https.onCall(
             });
             logger.info(`${functionName} Order ${orderId} edited successfully.`, logContext);
 
-            // 9. Log Action (Async)
+            // 9. Log Action (Async) - Logic remains the same as V1
             const logDetails = { orderId, customerId: orderData.customerId, oldItemCount: orderData.items.length, newItemCount: newOrderItems.length, oldFinalAmount: orderData.finalAmount, newFinalAmount, notesChanged: updatedNotes !== undefined, triggerUserId: userId, triggerUserRole: userRole };
             if (isAdmin) {
                 logAdminAction("EditOrder", logDetails).catch(err => logger.error("Failed logging admin action", { err }));
@@ -277,11 +277,11 @@ export const editOrder = functions.https.onCall(
                 logUserActivity("EditOrder", logDetails, userId).catch(err => logger.error("Failed logging user activity", { err }));
             }
 
-            // 10. Return Success
+            // 10. Return Success - Logic remains the same as V1
             return { success: true };
 
         } catch (error: any) {
-            // Error Handling
+            // Error Handling - Logic remains the same as V1
             logger.error(`${functionName} Execution failed.`, { ...logContext, error: error?.message, details: error?.details });
             const isHttpsError = error instanceof HttpsError;
             let finalErrorCode: ErrorCode = ErrorCode.InternalError;
