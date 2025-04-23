@@ -15,6 +15,7 @@ import { createOrder } from './core/createOrder';
 import { updateOrderStatus } from './core/updateOrderStatus';
 import { cancelOrder } from './core/cancelOrder';
 import { handleOrderCancellationSideEffects } from './core/handleOrderCancellationSideEffects'; // Background
+import { editOrder } from './core/editOrder'; // <-- שורה חדשה
 
 // --- Import Rentals Functions ---
 import { getAvailableRentalItems } from './rentals/getAvailableRentalItems';
@@ -42,7 +43,7 @@ import { listPermissions, assignRoleToUser } from './rbac/managePermissionsUsers
 
 // --- Import Admin Functions ---
 import { setUserActiveStatus, adjustBoxInventory } from './admin/manageUsersInventory';
-import { createPromoCode, updatePromoCode, deletePromoCode, listPromoCodes } from './admin/managePromoCodes'; // <-- שורה חדשה
+import { createPromoCode, updatePromoCode, deletePromoCode, listPromoCodes } from './admin/managePromoCodes';
 
 // --- Import Scheduled Functions ---
 import { autoCancelExpiredOrders, deactivateExpiredPromotions, cleanupOldLogs } from './scheduled/scheduledFunctions'; // Background
@@ -63,6 +64,7 @@ export {
   createOrder,
   updateOrderStatus,
   cancelOrder,
+  editOrder, // <-- שורה חדשה
   // Rentals
   getAvailableRentalItems,
   createRentalBooking,
@@ -89,10 +91,10 @@ export {
   // Admin
   setUserActiveStatus,
   adjustBoxInventory,
-  createPromoCode, // <-- שורה חדשה
-  updatePromoCode, // <-- שורה חדשה
-  deletePromoCode, // <-- שורה חדשה
-  listPromoCodes, // <-- שורה חדשה
+  createPromoCode,
+  updatePromoCode,
+  deletePromoCode,
+  listPromoCodes,
   // Auth
   sendOtp,
   verifyOtp,
