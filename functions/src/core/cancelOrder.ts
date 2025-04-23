@@ -9,13 +9,13 @@ import {
 } from '../models'; // Adjust path if needed
 
 // --- Import Helpers ---
-import { checkPermission } from '../utils/permissions'; // <-- Import REAL helper
+import { checkPermission } from '../utils/permissions';
 import { voidAuthorization, processRefund, extractPaymentDetailsFromResult } from '../utils/payment_helpers';
-// import { logUserActivity, logAdminAction } from '../utils/logging'; // Still using mock below
+import { logUserActivity, logAdminAction } from '../utils/logging'; // Using mock below
 
 // --- Mocks for other required helper functions (Replace with actual implementations) ---
-async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); }
-async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); }
+// async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); } // Imported
+// async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); } // Imported
 // --- End Mocks ---
 
 // --- Configuration ---
@@ -57,12 +57,12 @@ export const cancelOrder = functions.https.onCall(
         // secrets: ["PAYMENT_GATEWAY_SECRET"], // Uncomment if payment helper needs secrets
     },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[cancelOrder V3 - Permissions]"; // Updated version name
+        const functionName = "[cancelOrder V3 - Permissions]";
         const startTimeFunc = Date.now();
 
         // 1. Authentication & Authorization
         if (!request.auth?.uid) { return { success: false, error: "error.auth.unauthenticated", errorCode: ErrorCode.Unauthenticated }; }
-        const userId = request.auth.uid; // User initiating cancellation (Customer or Admin)
+        const userId = request.auth.uid;
         const data = request.data as CancelOrderInput;
         const logContext: any = { userId, orderId: data?.orderId, reason: data?.reason };
 
@@ -80,7 +80,7 @@ export const cancelOrder = functions.https.onCall(
         // --- Variables ---
         let orderData: Order;
         let userData: User;
-        let userRole: string | null; // Fetch user role
+        let userRole: string | null;
         let voidResult: Awaited<ReturnType<typeof voidAuthorization>> | null = null;
         let refundResult: Awaited<ReturnType<typeof processRefund>> | null = null;
         let updatedPaymentStatus: PaymentStatus;
@@ -88,19 +88,17 @@ export const cancelOrder = functions.https.onCall(
 
         // --- Firestore References ---
         const orderRef = db.collection('orders').doc(orderId);
-        const userRef = db.collection('users').doc(userId); // Needed for role check
+        const userRef = db.collection('users').doc(userId);
 
         try {
             // 3. Fetch User and Order Data Concurrently
             const [userSnap, orderSnap] = await Promise.all([userRef.get(), orderRef.get()]);
 
-            // Validate User
             if (!userSnap.exists) throw new HttpsError('not-found', `error.user.notFound::${userId}`, { errorCode: ErrorCode.UserNotFound });
             userData = userSnap.data() as User;
-            userRole = userData.role; // Get role
+            userRole = userData.role;
             logContext.userRole = userRole;
 
-            // Validate Order
             if (!orderSnap.exists) {
                 logger.warn(`${functionName} Order ${orderId} not found.`, logContext);
                 return { success: false, error: "error.order.notFound", errorCode: ErrorCode.OrderNotFound };
@@ -110,16 +108,14 @@ export const cancelOrder = functions.https.onCall(
             logContext.paymentStatus = orderData.paymentStatus;
             logContext.orderCustomerId = orderData.customerId;
 
-            // 4. Permission Check (Using REAL helper)
+            // 4. Permission Check
             const isOwner = userId === orderData.customerId;
             const isAdmin = userRole === 'Admin' || userRole === 'SuperAdmin';
             const requiredPermission = isOwner ? 'order:cancel:own' : (isAdmin ? 'order:cancel:any' : 'permission_denied');
-            // Pass fetched role to checkPermission to potentially save a read
             const hasPermission = await checkPermission(userId, userRole, requiredPermission, logContext);
 
             if (!hasPermission) {
                 logger.warn(`${functionName} Permission denied for user ${userId} (Role: ${userRole}) to cancel order ${orderId}.`, logContext);
-                // Use specific error code if possible, otherwise generic permission denied
                 const errorCode = (requiredPermission === 'permission_denied') ? ErrorCode.PermissionDenied : ErrorCode.NotOrderOwnerOrAdmin;
                 return { success: false, error: "error.permissionDenied.cancelOrder", errorCode: errorCode };
             }
@@ -135,9 +131,8 @@ export const cancelOrder = functions.https.onCall(
                  return { success: false, error: "error.order.alreadyCancelled", errorCode: ErrorCode.FailedPrecondition };
             }
 
-            // 6. Handle Payment Void/Refund (if applicable) - Logic remains the same as V2
+            // 6. Handle Payment Void/Refund
             updatedPaymentStatus = orderData.paymentStatus;
-
             if (orderData.paymentStatus === PaymentStatus.Authorized) {
                 const authId = orderData.authDetails?.authorizationId;
                 if (!authId) {
@@ -146,44 +141,30 @@ export const cancelOrder = functions.https.onCall(
                 logger.info(`${functionName} Order ${orderId}: Payment is Authorized. Attempting to void authorization ${authId}...`, logContext);
                 voidResult = await voidAuthorization(authId);
                 updatedPaymentStatus = voidResult.success ? PaymentStatus.Voided : PaymentStatus.VoidFailed;
-                if (!voidResult.success) {
-                    logger.error(`${functionName} Payment void failed for order ${orderId}, AuthID: ${authId}.`, { ...logContext, error: voidResult.errorMessage, code: voidResult.errorCode });
-                } else {
-                    logger.info(`${functionName} Payment void successful for order ${orderId}, AuthID: ${authId}.`, logContext);
-                }
+                if (!voidResult.success) logger.error(`${functionName} Payment void failed.`, { ...logContext, error: voidResult.errorMessage });
+                else logger.info(`${functionName} Payment void successful.`, logContext);
             } else if (orderData.paymentStatus === PaymentStatus.Captured || orderData.paymentStatus === PaymentStatus.Paid) {
                 const transactionId = orderData.paymentDetails?.transactionId ?? orderData.authDetails?.transactionId;
                 const amountToRefund = orderData.finalAmount;
-
                 if (!transactionId) {
-                     throw new HttpsError('internal', `error.internal.missingPaymentInfo::${orderId}`, { errorCode: ErrorCode.MissingPaymentInfo });
-                }
-                 if (amountToRefund != null && amountToRefund > 0) {
-                    logger.info(`${functionName} Order ${orderId}: Payment is ${orderData.paymentStatus}. Attempting to refund ${amountToRefund} ${orderData.currencyCode} for transaction ${transactionId}...`, logContext);
-                    refundResult = await processRefund(
-                        transactionId, amountToRefund, orderData.currencyCode,
-                        reason || (isOwner ? "customer_request" : "admin_cancellation"), orderId
-                    );
+                     logger.error(`${functionName} Cannot refund payment for booking ${orderId}: Missing transactionId.`, logContext);
+                     updatedPaymentStatus = PaymentStatus.RefundFailed;
+                } else if (amountToRefund != null && amountToRefund > 0) {
+                    logger.info(`${functionName} Attempting to refund ${amountToRefund} ${orderData.currencyCode} for transaction ${transactionId}...`, logContext);
+                    refundResult = await processRefund( transactionId, amountToRefund, orderData.currencyCode, reason || (isOwner ? "customer_request" : "admin_cancellation"), orderId );
                     updatedPaymentStatus = refundResult.success ? PaymentStatus.Refunded : PaymentStatus.RefundFailed;
-                    if (!refundResult.success) {
-                        logger.error(`${functionName} Payment refund failed for order ${orderId}, TxID: ${transactionId}.`, { ...logContext, error: refundResult.errorMessage, code: refundResult.errorCode });
-                    } else {
-                        logger.info(`${functionName} Payment refund successful for order ${orderId}, TxID: ${transactionId}, RefundID: ${refundResult.refundId}.`, logContext);
-                        refundDetails = {
-                            refundId: refundResult.refundId, refundTimestamp: refundResult.timestamp,
-                            refundAmountSmallestUnit: refundResult.amountRefunded, gatewayName: refundResult.gatewayName,
-                            reason: reason || (isOwner ? "customer_request" : "admin_cancellation"),
-                        };
+                    if (!refundResult.success) logger.error(`${functionName} Payment refund failed.`, { ...logContext, error: refundResult.errorMessage });
+                    else {
+                        logger.info(`${functionName} Payment refund successful. RefundID: ${refundResult.refundId}.`, logContext);
+                        refundDetails = { refundId: refundResult.refundId, refundTimestamp: refundResult.timestamp, refundAmountSmallestUnit: refundResult.amountRefunded, gatewayName: refundResult.gatewayName, reason: reason || (isOwner ? "customer_request" : "admin_cancellation") };
                     }
                  } else {
                      logger.warn(`${functionName} Order ${orderId}: No amount to refund (${amountToRefund}). Skipping refund process.`, logContext);
                  }
-            } else {
-                logger.info(`${functionName} Order ${orderId}: No payment action required for cancellation based on current payment status '${orderData.paymentStatus}'.`, logContext);
             }
             logContext.updatedPaymentStatus = updatedPaymentStatus;
 
-            // 7. Firestore Transaction to Update Order Status - Logic remains the same as V2
+            // 7. Firestore Transaction to Update Order Status
             logger.info(`${functionName} Starting Firestore transaction to update order status...`, logContext);
             await db.runTransaction(async (transaction) => {
                 const orderTxSnap = await transaction.get(orderRef);
@@ -223,19 +204,21 @@ export const cancelOrder = functions.https.onCall(
             });
             logger.info(`${functionName} Order ${orderId} status updated to Cancelled successfully.`, logContext);
 
-            // 8. Log Action (Async) - Logic remains the same as V2
+            // 8. Log Action (Async)
             const logDetails = { orderId, customerId: orderData.customerId, cancelledBy: userId, userRole, reason, initialStatus: orderData.status, finalPaymentStatus: updatedPaymentStatus };
             if (isAdmin) {
-                logAdminAction("CancelOrder", logDetails).catch(err => logger.error("Failed logging admin action", { err }));
+                logAdminAction("CancelOrder", logDetails)
+                    .catch(err => logger.error("Failed logging CancelOrder admin action", { err })); // Fixed catch
             } else {
-                logUserActivity("CancelOrder", logDetails, userId).catch(err => logger.error("Failed logging user activity", { err }));
+                logUserActivity("CancelOrder", logDetails, userId)
+                    .catch(err => logger.error("Failed logging CancelOrder user activity", { err })); // Fixed catch
             }
 
-            // 9. Return Success - Logic remains the same as V2
+            // 9. Return Success
             return { success: true };
 
         } catch (error: any) {
-            // Error Handling - Logic remains the same as V2
+            // Error Handling
             logger.error(`${functionName} Execution failed.`, { ...logContext, error: error?.message, details: error?.details });
             const isHttpsError = error instanceof HttpsError;
             let finalErrorCode: ErrorCode = ErrorCode.InternalError;
@@ -254,7 +237,8 @@ export const cancelOrder = functions.https.onCall(
                  if (parts[2]) finalErrorMessageKey += `::${parts[2]}`;
             }
 
-            logUserActivity("CancelOrderFailed", { orderId, reason, error: error.message }, userId).catch(...)
+            logUserActivity("CancelOrderFailed", { orderId, reason, error: error.message }, userId)
+                .catch(err => logger.error("Failed logging CancelOrderFailed user activity", { err })); // Fixed catch
 
             return { success: false, error: finalErrorMessageKey, errorCode: finalErrorCode };
         } finally {
