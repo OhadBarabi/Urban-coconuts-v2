@@ -11,11 +11,11 @@ import {
 // --- Import Helpers ---
 import { checkPermission } from '../utils/permissions';
 import { chargePaymentMethod } from '../utils/payment_helpers';
-import { sendPushNotification } from '../utils/notifications'; // <-- Import REAL helper
-// import { logUserActivity } from '../utils/logging'; // Still using mock below
+import { sendPushNotification } from '../utils/notifications';
+import { logUserActivity } from '../utils/logging'; // Using mock below
 
 // --- Mocks for other required helper functions (Replace with actual implementations) ---
-async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); }
+// async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); } // Already imported
 // sendPushNotification is now imported from the helper
 // --- End Mocks ---
 
@@ -59,7 +59,7 @@ export const addTipToOrder = functions.https.onCall(
         // secrets: ["PAYMENT_GATEWAY_SECRET"], // Uncomment if payment helper needs secrets
     },
     async (request): Promise<{ success: true; requiresAction?: boolean; actionUrl?: string } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[addTipToOrder V4 - Notifications]"; // Updated version name
+        const functionName = "[addTipToOrder V4 - Notifications]"; // Keep track of helper usage
         const startTimeFunc = Date.now();
 
         // 1. Authentication & Authorization
@@ -170,30 +170,27 @@ export const addTipToOrder = functions.https.onCall(
 
             // 8. Trigger Notifications (Using REAL Helper - currently Mock)
             if (!chargeResult.requiresAction && chargeResult.success && orderData.courierId) {
-                 // Call the imported helper function
                  sendPushNotification({
-                     userId: orderData.courierId, // Target the courier
+                     userId: orderData.courierId,
                      type: "TipReceived",
-                     titleKey: "notification.tipReceived.title", // i18n keys for client app
+                     titleKey: "notification.tipReceived.title",
                      messageKey: "notification.tipReceived.message",
-                     messageParams: { // Parameters for localization
-                         // Consider privacy: maybe don't send customer name?
-                         // customerName: userData.displayName ?? 'Customer',
-                         amount: (tipAmountSmallestUnit / 100).toFixed(2), // Format amount
+                     messageParams: {
+                         amount: (tipAmountSmallestUnit / 100).toFixed(2),
                          currency: orderData.currencyCode
                      },
-                     payload: { // Optional data for client app navigation
+                     payload: {
                          orderId: orderId,
-                         screen: 'orderDetails' // Example screen hint
+                         screen: 'orderDetails'
                      }
-                 }).catch(err => logger.error("Failed sending courier tip notification", { err }));
+                 }).catch(err => logger.error("Failed sending courier tip notification", { err })); // Fixed catch
             }
 
             // 9. Log User Activity (Async)
             logUserActivity("AddTipToOrder", { orderId, tipAmount: tipAmountSmallestUnit, paymentSuccess: chargeResult.success, requiresAction: chargeResult.requiresAction }, customerId)
-                .catch(err => logger.error("Failed logging user activity", { err }));
+                .catch(err => logger.error("Failed logging AddTipToOrder user activity", { err })); // Fixed catch
 
-            // 10. Return Success (potentially with action required)
+            // 10. Return Success
             const successResponse: { success: true; requiresAction?: boolean; actionUrl?: string } = { success: true };
             if (chargeResult.requiresAction) {
                 successResponse.requiresAction = true;
@@ -215,7 +212,8 @@ export const addTipToOrder = functions.https.onCall(
                  if (error.message.includes("::")) { finalErrorMessageKey = error.message; }
             }
 
-            logUserActivity("AddTipToOrderFailed", { orderId, tipAmount: data?.tipAmountSmallestUnit, error: error.message }, customerId).catch(...)
+            logUserActivity("AddTipToOrderFailed", { orderId, tipAmount: data?.tipAmountSmallestUnit, error: error.message }, customerId)
+                .catch(err => logger.error("Failed logging AddTipToOrderFailed user activity", { err })); // Fixed catch
 
             return { success: false, error: finalErrorMessageKey, errorCode: finalErrorCode };
         } finally {
