@@ -16,7 +16,7 @@ import { updateOrderStatus } from './core/updateOrderStatus';
 import { cancelOrder } from './core/cancelOrder';
 import { handleOrderCancellationSideEffects } from './core/handleOrderCancellationSideEffects'; // Background
 import { editOrder } from './core/editOrder';
-import { addTipToOrder } from './core/addTipToOrder'; // <-- שורה חדשה
+import { addTipToOrder } from './core/addTipToOrder';
 
 // --- Import Rentals Functions ---
 import { getAvailableRentalItems } from './rentals/getAvailableRentalItems';
@@ -48,6 +48,7 @@ import { createPromoCode, updatePromoCode, deletePromoCode, listPromoCodes } fro
 
 // --- Import Scheduled Functions ---
 import { autoCancelExpiredOrders, deactivateExpiredPromotions, cleanupOldLogs } from './scheduled/scheduledFunctions'; // Background
+import { calculateVipTiers } from './scheduled/calculateVipTiers'; // <-- שורה חדשה
 
 // --- Import Auth Functions ---
 import { sendOtp } from './auth/sendOtp';
@@ -66,7 +67,7 @@ export {
   updateOrderStatus,
   cancelOrder,
   editOrder,
-  addTipToOrder, // <-- שורה חדשה
+  addTipToOrder,
   // Rentals
   getAvailableRentalItems,
   createRentalBooking,
@@ -114,6 +115,7 @@ autoCancelExpiredOrders;
 deactivateExpiredPromotions;
 cleanupOldLogs;
 handleOrderCancellationSideEffects;
+calculateVipTiers; // <-- שורה חדשה
 // Note: Utility functions like logUserActivity don't need to be referenced here
 // as they are imported and used by other functions.
 // ... add references for other background/triggered functions ...
