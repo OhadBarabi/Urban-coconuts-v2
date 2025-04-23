@@ -6,12 +6,11 @@ import { HttpsError } from "firebase-functions/v2/https";
 // --- Import Models ---
 import { User, Box, Shift, ShiftStatus } from '../models'; // Adjust path if needed
 
-// --- Assuming helper functions are imported or defined elsewhere ---
-// import { checkPermission } from '../utils/permissions'; // Might not be needed if only courier role check is done
-// import { logUserActivity } from '../utils/logging';
+// --- Import Helpers ---
+import { checkPermission } from '../utils/permissions'; // <-- Import REAL helper
+// import { logUserActivity } from '../utils/logging'; // Still using mock below
 
-// --- Mocks for required helper functions (Replace with actual implementations) ---
-async function checkPermission(userId: string | null, userRole: string | null, permissionId: string, context?: any): Promise<boolean> { logger.info(`[Mock Auth] Check ${permissionId} for ${userId} (${userRole})`, context); return userId != null && userRole === 'Courier'; }
+// --- Mocks for other required helper functions (Replace with actual implementations) ---
 async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); }
 // --- End Mocks ---
 
@@ -53,7 +52,7 @@ export const startShift = functions.https.onCall(
         timeoutSeconds: 60,
     },
     async (request): Promise<{ success: true; shiftId: string } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[startShift V1]";
+        const functionName = "[startShift V2 - Permissions]"; // Updated version name
         const startTimeFunc = Date.now();
 
         // 1. Authentication
@@ -79,25 +78,40 @@ export const startShift = functions.https.onCall(
         const shiftsCollectionRef = db.collection('shifts');
 
         try {
-            // 3. Firestore Transaction
+            // Fetch Courier User Data Once for Role Check
+            const courierSnapInitial = await courierRef.get();
+            if (!courierSnapInitial.exists) throw new HttpsError('not-found', `error.user.notFound::${courierId}`, { errorCode: ErrorCode.UserNotFound });
+            const courierDataInitial = courierSnapInitial.data() as User;
+            const courierRole = courierDataInitial.role;
+            logContext.courierRole = courierRole;
+
+            // 3. Permission Check (Using REAL helper)
+            // Define permission: 'courier:shift:start'
+            const hasPermission = await checkPermission(courierId, courierRole, 'courier:shift:start', logContext);
+            if (!hasPermission) {
+                // Check if it's because they are not a courier or lack specific permission
+                const specificErrorCode = courierRole !== 'Courier' ? ErrorCode.NotCourier : ErrorCode.PermissionDenied;
+                const errorMessage = courierRole !== 'Courier' ? "error.startShift.notCourier" : "error.permissionDenied.startShift";
+                logger.warn(`${functionName} Permission denied for user ${courierId} (Role: ${courierRole}) to start shift.`, logContext);
+                return { success: false, error: errorMessage, errorCode: specificErrorCode };
+            }
+
+            // 4. Firestore Transaction
             logger.info(`${functionName} Starting Firestore transaction...`, logContext);
-            const newShiftId = shiftsCollectionRef.doc().id; // Pre-generate shift ID for use in updates
+            const newShiftId = shiftsCollectionRef.doc().id; // Pre-generate shift ID
 
             await db.runTransaction(async (transaction) => {
                 // Read courier and box data within the transaction
+                // Courier data is re-read to ensure shiftStatus hasn't changed
                 const [courierSnap, boxSnap] = await Promise.all([
                     transaction.get(courierRef),
                     transaction.get(boxRef)
                 ]);
 
-                // --- Validate Courier ---
-                if (!courierSnap.exists) {
-                    throw new Error(`TX_ERR::${ErrorCode.UserNotFound}`);
-                }
+                // --- Validate Courier State ---
+                if (!courierSnap.exists) throw new Error(`TX_ERR::${ErrorCode.UserNotFound}`); // Should not happen if initial check passed
                 const courierData = courierSnap.data() as User;
-                if (courierData.role !== 'Courier') {
-                    throw new Error(`TX_ERR::${ErrorCode.NotCourier}`);
-                }
+                // Role check already done, but double-check shift status
                 if (courierData.shiftStatus === ShiftStatus.OnDuty) {
                     throw new Error(`TX_ERR::${ErrorCode.AlreadyOnShift}`);
                 }
@@ -106,7 +120,7 @@ export const startShift = functions.https.onCall(
                      throw new Error(`TX_ERR::${ErrorCode.BoxNotAssignedToCourier}`);
                 }
 
-                // --- Validate Box ---
+                // --- Validate Box State ---
                 if (!boxSnap.exists) {
                     throw new Error(`TX_ERR::${ErrorCode.BoxNotFound}`);
                 }
@@ -114,12 +128,7 @@ export const startShift = functions.https.onCall(
                 if (!boxData.isActive) {
                     throw new Error(`TX_ERR::${ErrorCode.BoxInactive}`);
                 }
-                // Check if the box is already assigned to another ACTIVE courier
-                // This requires checking the assignedCourierId AND potentially their shift status if needed,
-                // but checking assignedCourierId should be sufficient if endShift clears it.
                 if (boxData.assignedCourierId && boxData.assignedCourierId !== courierId) {
-                    // We might need an extra read here to confirm the other courier is *really* on duty,
-                    // but let's assume assignedCourierId is reliable for now.
                     logger.warn(`${functionName} TX Check: Box ${boxId} is already assigned to courier ${boxData.assignedCourierId}.`, logContext);
                     throw new Error(`TX_ERR::${ErrorCode.BoxAlreadyAssigned}`);
                 }
@@ -129,10 +138,10 @@ export const startShift = functions.https.onCall(
 
                 // 1. Create new Shift document
                 const newShiftData: Shift = {
-                    shiftId: newShiftId, // Store the ID in the document as well
+                    shiftId: newShiftId,
                     courierId: courierId,
                     boxId: boxId,
-                    startTime: now, // Use server timestamp? 'now' is safer in TX
+                    startTime: now,
                     endTime: null,
                     startCashSmallestUnit: startCashSmallestUnit,
                     endCashSmallestUnit: null,
@@ -152,30 +161,30 @@ export const startShift = functions.https.onCall(
                     shiftStatus: ShiftStatus.OnDuty,
                     currentShiftId: newShiftId,
                     currentBoxId: boxId,
-                    updatedAt: now, // Update courier timestamp
+                    updatedAt: now,
                 });
 
                 // 3. Update Box document
                 transaction.update(boxRef, {
                     assignedCourierId: courierId,
-                    updatedAt: now, // Update box timestamp
+                    updatedAt: now,
                 });
 
             }); // End Transaction
             logger.info(`${functionName} Transaction successful. Shift ${newShiftId} started for courier ${courierId} at box ${boxId}.`, logContext);
 
 
-            // 4. Log User Activity (Async)
+            // 5. Log User Activity (Async)
             logUserActivity("StartShift", { boxId, shiftId: newShiftId, startCash: startCashSmallestUnit }, courierId)
                 .catch(err => logger.error("Failed logging user activity", { err }));
 
-            // 5. Return Success
+            // 6. Return Success
             return { success: true, shiftId: newShiftId };
 
         } catch (error: any) {
             // Error Handling
             logger.error(`${functionName} Execution failed.`, { ...logContext, error: error?.message, details: error?.details });
-            const isHttpsError = error instanceof HttpsError; // Should not happen with TX errors
+            const isHttpsError = error instanceof HttpsError;
             let finalErrorCode: ErrorCode = ErrorCode.InternalError;
             let finalErrorMessageKey: string = "error.internalServer";
 
@@ -183,12 +192,11 @@ export const startShift = functions.https.onCall(
                  const txErrCode = error.message.split('::')[1] as ErrorCode;
                  finalErrorCode = Object.values(ErrorCode).includes(txErrCode) ? txErrCode : ErrorCode.TransactionFailed;
                  finalErrorMessageKey = `error.startShift.${finalErrorCode.toLowerCase()}`;
-            } else if (isHttpsError) { // Should not happen here but handle defensively
+            } else if (isHttpsError) { // Handle errors from initial user fetch
                 finalErrorCode = (error.details as any)?.errorCode as ErrorCode || ErrorCode.InternalError;
                 finalErrorMessageKey = error.message.startsWith("error.") ? error.message : `error.startShift.generic`;
             }
 
-            // Log failure activity?
             logUserActivity("StartShiftFailed", { boxId, error: error.message }, courierId).catch(...)
 
             return { success: false, error: finalErrorMessageKey, errorCode: finalErrorCode };
