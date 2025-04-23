@@ -6,47 +6,47 @@ import { HttpsError } from "firebase-functions/v2/https";
 // --- Import Models ---
 import { User, Box } from '../models'; // Adjust path if needed
 
-// --- Assuming helper functions are imported or defined elsewhere ---
-// import { checkPermission } from '../utils/permissions';
-// import { logAdminAction } from '../utils/logging';
+// --- Import Helpers ---
+import { checkPermission } from '../utils/permissions'; // <-- Import REAL helper
+// import { logAdminAction } from '../utils/logging'; // Using mock below
 
-// --- Mocks for required helper functions (Replace with actual implementations) ---
-async function checkPermission(userId: string | null, userRole: string | null, permissionId: string, context?: any): Promise<boolean> { logger.info(`[Mock Auth] Check ${permissionId} for ${userId} (${userRole})`, context); return userId != null && (userRole === 'Admin' || userRole === 'SuperAdmin'); }
+// --- Mocks for other required helper functions (Replace with actual implementations) ---
 async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); }
 // --- End Mocks ---
 
 // --- Configuration ---
 // Ensure Firebase Admin is initialized (moved to index.ts)
 const db = admin.firestore();
-const auth = admin.auth(); // Needed for disabling auth user
+const { FieldValue } = admin.firestore;
 const FUNCTION_REGION = "me-west1"; // <<<--- CHANGE TO YOUR REGION
 
 // --- Enums ---
 enum ErrorCode {
     Unauthenticated = "UNAUTHENTICATED", PermissionDenied = "PERMISSION_DENIED", InvalidArgument = "INVALID_ARGUMENT",
-    NotFound = "NOT_FOUND", // User or Box not found
+    NotFound = "NOT_FOUND", // Target User or Box not found
+    Aborted = "ABORTED", // Transaction failed
     InternalError = "INTERNAL_ERROR",
     // Specific codes
-    UserNotFound = "USER_NOT_FOUND",
+    UserNotFound = "USER_NOT_FOUND", // Target user or Admin user not found
     BoxNotFound = "BOX_NOT_FOUND",
-    FirebaseAuthError = "FIREBASE_AUTH_ERROR",
-    InvalidInventoryAdjustment = "INVALID_INVENTORY_ADJUSTMENT",
+    InvalidAdjustmentFormat = "INVALID_ADJUSTMENT_FORMAT",
+    TransactionFailed = "TRANSACTION_FAILED",
 }
 
 // --- Interfaces ---
 interface SetUserActiveStatusInput {
-    userId: string; // UID of the target user
-    isActive: boolean; // The desired status
+    userId: string; // ID of the user to update
+    isActive: boolean; // The new active status
 }
 
 interface InventoryAdjustment {
     productId: string;
-    change: number; // Positive to add, negative to remove (integer)
+    change: number; // Positive integer to add, negative integer to remove
 }
 interface AdjustBoxInventoryInput {
     boxId: string;
-    adjustments: InventoryAdjustment[];
-    reason: string; // Reason for adjustment (e.g., "Stock Count Correction", "Spoilage")
+    adjustments: InventoryAdjustment[]; // Array of adjustments
+    reason: string; // Reason for the adjustment (e.g., "Manual Stock Count", "Damaged Goods")
 }
 
 
@@ -56,77 +56,76 @@ interface AdjustBoxInventoryInput {
 export const setUserActiveStatus = functions.https.onCall(
     { region: FUNCTION_REGION, memory: "128MiB" },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[setUserActiveStatus V1]";
+        const functionName = "[setUserActiveStatus V2 - Permissions]"; // Updated version name
         const startTimeFunc = Date.now();
 
-        // 1. Auth & Permissions
+        // 1. Authentication & Authorization
         if (!request.auth?.uid) { return { success: false, error: "error.auth.unauthenticated", errorCode: ErrorCode.Unauthenticated }; }
         const adminUserId = request.auth.uid;
         const data = request.data as SetUserActiveStatusInput;
-        const logContext: any = { adminUserId, targetUserId: data?.userId, isActive: data?.isActive };
+        const logContext: any = { adminUserId, targetUserId: data?.userId, targetStatus: data?.isActive };
+
         logger.info(`${functionName} Invoked.`, logContext);
 
+        // Fetch admin user role for permission check
         let adminUserRole: string | null = null;
         try {
-            const userSnap = await db.collection('users').doc(adminUserId).get();
-            if (userSnap.exists) adminUserRole = (userSnap.data() as User)?.role;
-            const hasPermission = await checkPermission(adminUserId, adminUserRole, 'admin:user:set_active');
-            if (!hasPermission) { return { success: false, error: "error.permissionDenied.setActiveStatus", errorCode: ErrorCode.PermissionDenied }; }
-        } catch (e: any) { logger.error("Auth/Permission check failed", e); return { success: false, error: "error.internalServer", errorCode: ErrorCode.InternalError }; }
+            const adminUserSnap = await db.collection('users').doc(adminUserId).get();
+            if (!adminUserSnap.exists) throw new HttpsError('not-found', `Admin user ${adminUserId} not found.`, { errorCode: ErrorCode.UserNotFound });
+            adminUserRole = (adminUserSnap.data() as User)?.role;
+            logContext.adminUserRole = adminUserRole;
+
+            // Permission Check (Using REAL helper) - Define permission: 'admin:user:setActiveStatus'
+            const hasPermission = await checkPermission(adminUserId, adminUserRole, 'admin:user:setActiveStatus', logContext);
+            if (!hasPermission) {
+                logger.warn(`${functionName} Permission denied for admin ${adminUserId} (Role: ${adminUserRole}) to set user active status.`, logContext);
+                return { success: false, error: "error.permissionDenied.setUserActive", errorCode: ErrorCode.PermissionDenied };
+            }
+        } catch (e: any) {
+             logger.error("Auth/Permission check failed", { ...logContext, error: e.message });
+             const code = e instanceof HttpsError ? e.details?.errorCode : ErrorCode.InternalError;
+             const msg = e instanceof HttpsError ? e.message : "error.internalServer";
+             return { success: false, error: msg, errorCode: code || ErrorCode.InternalError };
+        }
 
         // 2. Input Validation
         if (!data?.userId || typeof data.userId !== 'string' || typeof data.isActive !== 'boolean') {
-            logger.error(`${functionName} Invalid input: Missing userId or isActive flag.`, logContext);
-            return { success: false, error: "error.invalidInput.userIdOrActiveFlag", errorCode: ErrorCode.InvalidArgument };
+            logger.error(`${functionName} Invalid input data structure or types.`, { ...logContext, data: JSON.stringify(data).substring(0,500) });
+            return { success: false, error: "error.invalidInput.userIdOrStatus", errorCode: ErrorCode.InvalidArgument };
         }
-        const { userId: targetUserId, isActive } = data;
+        const { userId: targetUserId, isActive: targetIsActive } = data;
 
-        // Prevent admin from disabling themselves? Optional check.
-        // if (adminUserId === targetUserId && !isActive) {
-        //     return { success: false, error: "error.admin.cannotDisableSelf", errorCode: ErrorCode.PermissionDenied };
-        // }
+        // Prevent admin from deactivating themselves? (Optional safeguard)
+        if (targetUserId === adminUserId && !targetIsActive) {
+             logger.warn(`${functionName} Admin user ${adminUserId} attempted to deactivate themselves. Denied.`, logContext);
+             return { success: false, error: "error.setUserActive.cannotDeactivateSelf", errorCode: ErrorCode.PermissionDenied };
+        }
 
-        // 3. Update Firestore and Firebase Auth
+        // 3. Update Target User Document
         const targetUserRef = db.collection('users').doc(targetUserId);
         try {
-            // Check if user exists in Firestore first
+            // Check if user exists before updating
             const targetUserSnap = await targetUserRef.get();
             if (!targetUserSnap.exists) {
-                logger.warn(`${functionName} Target user '${targetUserId}' not found in Firestore.`, logContext);
-                return { success: false, error: "error.user.notFound", errorCode: ErrorCode.UserNotFound };
+                 logger.warn(`${functionName} Target user ${targetUserId} not found.`, logContext);
+                 return { success: false, error: "error.setUserActive.userNotFound", errorCode: ErrorCode.UserNotFound };
             }
 
-            // Update Firestore document
-            logger.info(`${functionName} Updating Firestore 'isActive' for user '${targetUserId}' to ${isActive}.`, logContext);
             await targetUserRef.update({
-                isActive: isActive,
-                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                isActive: targetIsActive,
+                updatedAt: FieldValue.serverTimestamp()
             });
-
-            // Update Firebase Auth user disabled status
-            logger.info(`${functionName} Updating Firebase Auth 'disabled' status for user '${targetUserId}' to ${!isActive}.`, logContext);
-            await auth.updateUser(targetUserId, { disabled: !isActive });
-
-            logger.info(`${functionName} User '${targetUserId}' active status set to ${isActive} successfully.`, logContext);
+            logger.info(`${functionName} Active status for user '${targetUserId}' set to ${targetIsActive}.`, logContext);
 
             // 4. Log Admin Action (Async)
-            logAdminAction("SetUserActiveStatus", { targetUserId, isActive, triggerUserId: adminUserId }).catch(err => logger.error("Failed logging admin action", { err }));
+            logAdminAction("SetUserActiveStatus", { targetUserId, targetIsActive, triggerUserId: adminUserId }).catch(err => logger.error("Failed logging admin action", { err }));
 
             // 5. Return Success
             return { success: true };
 
         } catch (error: any) {
-            if ((error as any)?.code === 5) { // Firestore NOT_FOUND (should be caught above)
-                 logger.error(`${functionName} Target user '${targetUserId}' not found during update.`, { ...logContext, error: error.message });
-                 return { success: false, error: "error.user.notFound", errorCode: ErrorCode.UserNotFound };
-            }
-            if ((error as any)?.code?.startsWith('auth/')) { // Firebase Auth errors
-                logger.error(`${functionName} Firebase Auth error updating user '${targetUserId}'.`, { ...logContext, error: error.message, code: (error as any).code });
-                 // Should we revert the Firestore update? Maybe log critical error.
-                 logAdminAction("SetUserActiveStatusFailedAuth", { targetUserId, isActive, reason: error.message, code: (error as any).code, triggerUserId: adminUserId }).catch(...);
-                 return { success: false, error: "error.auth.updateUserFailed", errorCode: ErrorCode.FirebaseAuthError };
-            }
             logger.error(`${functionName} Failed to set active status for user '${targetUserId}'.`, { ...logContext, error: error.message });
+            // Handle potential update errors
             return { success: false, error: "error.internalServer", errorCode: ErrorCode.InternalError };
         } finally {
             logger.info(`${functionName} Execution finished. Duration: ${Date.now() - startTimeFunc}ms`, logContext);
@@ -139,97 +138,115 @@ export const setUserActiveStatus = functions.https.onCall(
 // === Adjust Box Inventory Function ==========================================
 // ============================================================================
 export const adjustBoxInventory = functions.https.onCall(
-    { region: FUNCTION_REGION, memory: "256MiB" }, // More memory for potential transaction
+    { region: FUNCTION_REGION, memory: "256MiB" }, // May need more memory if adjustments array is large
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[adjustBoxInventory V1]";
+        const functionName = "[adjustBoxInventory V2 - Permissions]"; // Updated version name
         const startTimeFunc = Date.now();
 
-        // 1. Auth & Permissions
+        // 1. Authentication & Authorization
         if (!request.auth?.uid) { return { success: false, error: "error.auth.unauthenticated", errorCode: ErrorCode.Unauthenticated }; }
         const adminUserId = request.auth.uid;
         const data = request.data as AdjustBoxInventoryInput;
-        const logContext: any = { adminUserId, boxId: data?.boxId, reason: data?.reason, adjustmentCount: data?.adjustments?.length };
+        const logContext: any = { adminUserId, boxId: data?.boxId, adjustmentCount: data?.adjustments?.length, reason: data?.reason };
+
         logger.info(`${functionName} Invoked.`, logContext);
 
+        // Fetch admin user role for permission check
         let adminUserRole: string | null = null;
         try {
-            const userSnap = await db.collection('users').doc(adminUserId).get();
-            if (userSnap.exists) adminUserRole = (userSnap.data() as User)?.role;
-            const hasPermission = await checkPermission(adminUserId, adminUserRole, 'admin:inventory:adjust');
-            if (!hasPermission) { return { success: false, error: "error.permissionDenied.adjustInventory", errorCode: ErrorCode.PermissionDenied }; }
-        } catch (e: any) { logger.error("Auth/Permission check failed", e); return { success: false, error: "error.internalServer", errorCode: ErrorCode.InternalError }; }
+            const adminUserSnap = await db.collection('users').doc(adminUserId).get();
+            if (!adminUserSnap.exists) throw new HttpsError('not-found', `Admin user ${adminUserId} not found.`, { errorCode: ErrorCode.UserNotFound });
+            adminUserRole = (adminUserSnap.data() as User)?.role;
+            logContext.adminUserRole = adminUserRole;
+
+            // Permission Check (Using REAL helper) - Define permission: 'admin:inventory:adjust'
+            const hasPermission = await checkPermission(adminUserId, adminUserRole, 'admin:inventory:adjust', logContext);
+            if (!hasPermission) {
+                logger.warn(`${functionName} Permission denied for admin ${adminUserId} (Role: ${adminUserRole}) to adjust inventory.`, logContext);
+                return { success: false, error: "error.permissionDenied.adjustInventory", errorCode: ErrorCode.PermissionDenied };
+            }
+        } catch (e: any) {
+             logger.error("Auth/Permission check failed", { ...logContext, error: e.message });
+             const code = e instanceof HttpsError ? e.details?.errorCode : ErrorCode.InternalError;
+             const msg = e instanceof HttpsError ? e.message : "error.internalServer";
+             return { success: false, error: msg, errorCode: code || ErrorCode.InternalError };
+        }
 
         // 2. Input Validation
         if (!data?.boxId || typeof data.boxId !== 'string' ||
-            !data.reason || typeof data.reason !== 'string' || data.reason.trim().length === 0 ||
             !Array.isArray(data.adjustments) || data.adjustments.length === 0 ||
-            data.adjustments.some(adj => !adj.productId || typeof adj.productId !== 'string' || typeof adj.change !== 'number' || !Number.isInteger(adj.change)))
+            data.adjustments.some(adj => !adj.productId || typeof adj.productId !== 'string' || typeof adj.change !== 'number' || !Number.isInteger(adj.change)) ||
+            !data?.reason || typeof data.reason !== 'string' || data.reason.trim().length === 0)
         {
             logger.error(`${functionName} Invalid input data structure or types.`, { ...logContext, data: JSON.stringify(data).substring(0,500) });
-            return { success: false, error: "error.invalidInput.inventoryAdjustment", errorCode: ErrorCode.InvalidArgument };
+            let errorCode = ErrorCode.InvalidArgument;
+            if (data.adjustments && data.adjustments.some(adj => typeof adj.change !== 'number' || !Number.isInteger(adj.change))) {
+                 errorCode = ErrorCode.InvalidAdjustmentFormat;
+            }
+            return { success: false, error: "error.invalidInput.adjustmentData", errorCode: errorCode };
         }
         const { boxId, adjustments, reason } = data;
 
-        // 3. Perform Transactional Update
+        // 3. Firestore Transaction to Update Box Inventory
         const boxRef = db.collection('boxes').doc(boxId);
         try {
+            logger.info(`${functionName} Starting Firestore transaction for inventory adjustment...`, logContext);
             await db.runTransaction(async (transaction) => {
-                const boxSnap = await transaction.get(boxRef);
-                if (!boxSnap.exists) {
-                    throw new HttpsError('not-found', `Box ${boxId} not found.`, { errorCode: ErrorCode.BoxNotFound });
+                const boxTxSnap = await transaction.get(boxRef);
+                if (!boxTxSnap.exists) {
+                    throw new Error(`TX_ERR::${ErrorCode.BoxNotFound}`);
                 }
-                const boxData = boxSnap.data() as Box;
-                const currentInventory = boxData.inventory ?? {};
-                const updates: { [key: string]: admin.firestore.FieldValue } = {};
-                const logEntries: any[] = []; // For logging changes
+                const boxTxData = boxTxSnap.data() as Box;
+                const currentInventory = boxTxData.inventory ?? {};
 
+                const inventoryUpdates: { [key: string]: admin.firestore.FieldValue } = {};
                 for (const adj of adjustments) {
-                    const currentStock = currentInventory[adj.productId] ?? 0;
-                    const newStock = currentStock + adj.change;
+                    const productId = adj.productId;
+                    const change = adj.change;
+                    const currentStock = currentInventory[productId] ?? 0;
+                    const newStock = currentStock + change;
 
+                    // Prevent stock from going below zero due to adjustment
                     if (newStock < 0) {
-                        // Prevent negative inventory unless explicitly allowed by business logic
-                        logger.warn(`${functionName} Adjustment for product ${adj.productId} would result in negative stock (${newStock}). Skipping adjustment.`, logContext);
-                        // Option 1: Throw error to fail the whole transaction
-                        // throw new HttpsError('failed-precondition', `Adjustment for ${adj.productId} results in negative stock.`, { errorCode: ErrorCode.InvalidInventoryAdjustment });
-                        // Option 2: Skip this adjustment and continue with others (log warning)
-                        continue;
+                        logger.error(`${functionName} TX Check: Adjustment for product ${productId} would result in negative stock (${newStock}). Current: ${currentStock}, Change: ${change}.`, logContext);
+                        // Option 1: Throw error and fail transaction
+                        throw new Error(`TX_ERR::${ErrorCode.ResourceExhausted}::${productId}`);
+                        // Option 2: Adjust only down to zero? inventoryUpdates[`inventory.${productId}`] = 0;
                     }
-
-                    updates[`inventory.${adj.productId}`] = admin.firestore.FieldValue.increment(adj.change);
-                    logEntries.push({ productId: adj.productId, change: adj.change, oldStock: currentStock, newStock });
+                    inventoryUpdates[`inventory.${productId}`] = FieldValue.increment(change);
                 }
 
-                if (Object.keys(updates).length === 0) {
-                     logger.warn(`${functionName} No valid adjustments to apply after validation.`, logContext);
-                     // If all adjustments were skipped (e.g., all would lead to negative stock), maybe throw an error?
-                     // Or just return success as nothing needed changing? Let's return success.
-                     return; // Exit transaction without writing if no valid updates
-                }
+                // Add timestamp to the update
+                inventoryUpdates.updatedAt = FieldValue.serverTimestamp();
 
-                updates.updatedAt = admin.firestore.FieldValue.serverTimestamp(); // Update timestamp
-                transaction.update(boxRef, updates);
-                logContext.appliedAdjustments = logEntries; // Add applied changes to log context
-
+                // Perform Write
+                transaction.update(boxRef, inventoryUpdates);
             }); // End Transaction
-
             logger.info(`${functionName} Inventory for box '${boxId}' adjusted successfully.`, logContext);
 
             // 4. Log Admin Action (Async)
-            logAdminAction("AdjustBoxInventory", { boxId, reason, adjustments: logContext.appliedAdjustments ?? adjustments, triggerUserId: adminUserId }).catch(err => logger.error("Failed logging admin action", { err }));
+            // Consider logging each adjustment individually or summarizing
+            logAdminAction("AdjustBoxInventory", { boxId, reason, adjustments, triggerUserId: adminUserId }).catch(err => logger.error("Failed logging admin action", { err }));
 
             // 5. Return Success
             return { success: true };
 
         } catch (error: any) {
-            if (error instanceof HttpsError) { // Handle errors thrown within the transaction
-                 logger.error(`${functionName} Transaction failed for box '${boxId}'.`, { ...logContext, error: error.message, code: error.code, details: error.details });
-                 const errorCode = (error.details as any)?.errorCode ?? ErrorCode.InternalError;
-                 return { success: false, error: error.message, errorCode: errorCode };
-            }
-            // Handle other potential errors (e.g., network issues)
             logger.error(`${functionName} Failed to adjust inventory for box '${boxId}'.`, { ...logContext, error: error.message });
-            return { success: false, error: "error.internalServer", errorCode: ErrorCode.InternalError };
+            let finalErrorCode = ErrorCode.InternalError;
+            let finalErrorMessageKey = "error.internalServer";
+
+            if (error.message?.startsWith("TX_ERR::")) {
+                 const parts = error.message.split('::');
+                 const txErrCode = parts[1] as ErrorCode;
+                 finalErrorCode = Object.values(ErrorCode).includes(txErrCode) ? txErrCode : ErrorCode.TransactionFailed;
+                 finalErrorMessageKey = `error.transaction.${finalErrorCode.toLowerCase()}`;
+                 if (parts[2]) finalErrorMessageKey += `::${parts[2]}`; // e.g., error.transaction.resourceexhausted::productId
+            }
+
+            logAdminAction("AdjustBoxInventoryFailed", { boxId, reason, adjustments, error: error.message, triggerUserId: adminUserId }).catch(...)
+
+            return { success: false, error: finalErrorMessageKey, errorCode: finalErrorCode };
         } finally {
             logger.info(`${functionName} Execution finished. Duration: ${Date.now() - startTimeFunc}ms`, logContext);
         }
