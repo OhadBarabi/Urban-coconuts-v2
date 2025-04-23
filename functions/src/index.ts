@@ -15,7 +15,8 @@ import { createOrder } from './core/createOrder';
 import { updateOrderStatus } from './core/updateOrderStatus';
 import { cancelOrder } from './core/cancelOrder';
 import { handleOrderCancellationSideEffects } from './core/handleOrderCancellationSideEffects'; // Background
-import { editOrder } from './core/editOrder'; // <-- שורה חדשה
+import { editOrder } from './core/editOrder';
+import { addTipToOrder } from './core/addTipToOrder'; // <-- שורה חדשה
 
 // --- Import Rentals Functions ---
 import { getAvailableRentalItems } from './rentals/getAvailableRentalItems';
@@ -64,7 +65,8 @@ export {
   createOrder,
   updateOrderStatus,
   cancelOrder,
-  editOrder, // <-- שורה חדשה
+  editOrder,
+  addTipToOrder, // <-- שורה חדשה
   // Rentals
   getAvailableRentalItems,
   createRentalBooking,
