@@ -2,42 +2,33 @@ import * as functions from "firebase-functions/v2";
 import * as logger from "firebase-functions/logger";
 import * as admin from "firebase-admin";
 import { HttpsError } from "firebase-functions/v2/https";
-import { v4 as uuidv4 } from 'uuid'; // Needed if updating items with new IDs
 
 // --- Import Models ---
 import {
-    User, EventBooking, EventBookingStatus, EventBookingItem, AdminApprovalDetails, PaymentStatus
+    User, EventBooking, EventBookingStatus, SelectedEventItemInput, Menu,
+    AppConfigEventSettings, PaymentStatus // Added PaymentStatus
 } from '../models'; // Adjust path if needed
 
-// --- Assuming helper functions are imported or defined elsewhere ---
-// import { checkPermission } from '../utils/permissions';
-// import { sendPushNotification } from '../utils/notifications';
-// import { logAdminAction } from '../utils/logging';
-// import { calculateEventPrice } from '../utils/event_calculations'; // If recalculating price
+// --- Import Helpers ---
+import { checkPermission } from '../utils/permissions'; // <-- Import REAL helper
+// import { calculateEventTotal } from '../utils/event_calculations'; // Using mock below
+// import { logAdminAction } from '../utils/logging'; // Using mock below
+// import { sendPushNotification } from '../utils/notifications'; // Using mock below
 
-// --- Mocks for required helper functions (Replace with actual implementations) ---
-async function checkPermission(userId: string | null, userRole: string | null, permissionId: string, context?: any): Promise<boolean> { logger.info(`[Mock Auth] Check ${permissionId} for ${userId} (${userRole})`, context); return userId != null && (userRole === 'Admin' || userRole === 'SuperAdmin'); }
-async function sendPushNotification(params: any): Promise<void> { logger.info(`[Mock Notification] Sending notification`, params); }
-async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); }
-interface PriceCalculationResult { lineItems: EventBookingItem[]; totalAmountSmallestUnit: number; error?: string; }
-async function calculateEventPrice(items: any[], menuId: string | null, currency: string, durationMinutes: number): Promise<PriceCalculationResult> {
-    logger.info(`[Mock Calc] Recalculating event price...`);
+// --- Mocks for other required helper functions (Replace with actual implementations) ---
+// Mock for calculateEventTotal (if recalculation is needed for changes)
+interface EventTotalResult { totalAmount: number; error?: string; minOrderRequirementMet?: boolean; currencyCode?: string; }
+function calculateEventTotal(items: SelectedEventItemInput[], menu?: Menu | null, settings?: AppConfigEventSettings | null): EventTotalResult {
+    logger.info(`[Mock Event Calc] Recalculating total for approval with ${items.length} items...`);
     let total = 0;
-    const lineItems: EventBookingItem[] = items.map((item, index) => {
-        // If item has bookingItemId, keep it, otherwise generate new one? Or assume input items are the final ones?
-        // Let's assume input `updatedItems` replaces the old `selectedItems` entirely if provided.
-        const price = (item.quantity ?? 1) * 11000; // Mock slightly different price: 110 units
-        total += price;
-        return {
-            ...item,
-            bookingItemId: item.bookingItemId ?? uuidv4(), // Keep existing or generate new ID
-            productName: item.productName ?? `Mock Updated Item ${index + 1}`, // Keep existing or use mock
-            calculatedPriceSmallestUnit: price,
-            appliedUnitPriceSmallestUnit: 11000, // Mock unit price
-        };
-    });
-    return { lineItems, totalAmountSmallestUnit: total };
+    items.forEach((item, index) => { total += (item.quantity ?? 1) * (1500 + index * 100); }); // Mock calculation
+    const minOrderValue = settings?.minOrderValueSmallestUnit ?? 0;
+    const currency = menu?.currencyCode ?? settings?.defaultCurrencyCode ?? 'ILS';
+    return { totalAmount: total, minOrderRequirementMet: total >= minOrderValue, currencyCode: currency };
 }
+async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); }
+interface NotificationPayload { userId: string; type: string; titleKey: string; messageKey: string; messageParams?: { [key: string]: any }; payload?: { [key: string]: string }; }
+async function sendPushNotification(notification: NotificationPayload): Promise<void> { logger.info(`[Mock Notification] Sending push notification to ${notification.userId}`, notification); }
 // --- End Mocks ---
 
 // --- Configuration ---
@@ -50,219 +41,253 @@ const FUNCTION_REGION = "me-west1"; // <<<--- CHANGE TO YOUR REGION
 enum ErrorCode {
     Unauthenticated = "UNAUTHENTICATED", PermissionDenied = "PERMISSION_DENIED", InvalidArgument = "INVALID_ARGUMENT",
     NotFound = "NOT_FOUND", // Booking or User not found
-    FailedPrecondition = "FAILED_PRECONDITION", // Invalid status for approval
+    FailedPrecondition = "FAILED_PRECONDITION", // Invalid status for approval, Min order not met after changes
+    Aborted = "ABORTED", // Transaction failed (less likely here)
     InternalError = "INTERNAL_ERROR",
     // Specific codes
     BookingNotFound = "BOOKING_NOT_FOUND",
-    InvalidBookingStatus = "INVALID_BOOKING_STATUS", // Not PendingAdminApproval
-    InvalidApprovalStatus = "INVALID_APPROVAL_STATUS",
+    UserNotFound = "USER_NOT_FOUND", // Admin user not found
+    InvalidBookingStatus = "INVALID_BOOKING_STATUS", // Not 'PendingAdminApproval'
+    InvalidApprovalStatus = "INVALID_APPROVAL_STATUS", // Invalid value for approvalStatus
     CalculationError = "CALCULATION_ERROR", // If recalculation fails
+    MinOrderNotMet = "MIN_ORDER_NOT_MET", // If changes cause min order to fail
+    ConfigNotFound = "CONFIG_NOT_FOUND", // Event settings missing for recalculation
+    MenuNotFound = "MENU_NOT_FOUND", // If menu needed for recalculation
 }
-type ApprovalStatus = "Approved" | "Rejected" | "ApprovedWithChanges";
-const VALID_APPROVAL_STATUSES: ApprovalStatus[] = ["Approved", "Rejected", "ApprovedWithChanges"];
-
 
 // --- Interfaces ---
+type ApprovalStatus = "Approved" | "Rejected" | "ApprovedWithChanges";
 interface ApproveEventBookingInput {
     bookingId: string;
-    approvalStatus: ApprovalStatus | string; // Allow string for validation
-    adminNotes?: string | null;
-    // Optional: If approving with changes, provide the updated items and total
-    updatedItems?: EventBookingItem[] | null; // Use full EventBookingItem structure
-    updatedTotalAmountSmallestUnit?: number | null; // Integer
+    approvalStatus: ApprovalStatus; // The decision made by the admin
+    adminNotes?: string | null; // Optional notes from the admin
+    // Optional fields for 'ApprovedWithChanges'
+    updatedItems?: SelectedEventItemInput[] | null; // The modified list of items
+    updatedTotalAmountSmallestUnit?: number | null; // The new total amount if manually adjusted or recalculated
 }
 
 // --- The Cloud Function ---
 export const approveEventBooking = functions.https.onCall(
     {
         region: FUNCTION_REGION,
-        memory: "512MiB", // Allow memory if price recalculation happens
+        memory: "1GiB", // Allow memory for reads/recalculation
         timeoutSeconds: 60,
     },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[approveEventBooking V1]";
+        const functionName = "[approveEventBooking V2 - Permissions]"; // Updated version name
         const startTimeFunc = Date.now();
 
         // 1. Authentication & Authorization
-        if (!request.auth?.uid) {
-            logger.warn(`${functionName} Authentication failed: No UID.`);
-            return { success: false, error: "error.auth.unauthenticated", errorCode: ErrorCode.Unauthenticated };
-        }
-        const adminUserId = request.auth.uid;
+        if (!request.auth?.uid) { return { success: false, error: "error.auth.unauthenticated", errorCode: ErrorCode.Unauthenticated }; }
+        const adminUserId = request.auth.uid; // Admin performing the action
         const data = request.data as ApproveEventBookingInput;
         const logContext: any = { adminUserId, bookingId: data?.bookingId, approvalStatus: data?.approvalStatus };
 
         logger.info(`${functionName} Invoked.`, logContext);
 
         // 2. Input Validation
+        const validApprovalStatuses: ApprovalStatus[] = ["Approved", "Rejected", "ApprovedWithChanges"];
         if (!data?.bookingId || typeof data.bookingId !== 'string' ||
-            !data.approvalStatus || !VALID_APPROVAL_STATUSES.includes(data.approvalStatus as ApprovalStatus) ||
+            !data?.approvalStatus || !validApprovalStatuses.includes(data.approvalStatus) ||
             (data.adminNotes != null && typeof data.adminNotes !== 'string') ||
-            (data.approvalStatus === "ApprovedWithChanges" && (!Array.isArray(data.updatedItems) || data.updatedItems.length === 0 || typeof data.updatedTotalAmountSmallestUnit !== 'number')) ||
-            (data.approvalStatus !== "ApprovedWithChanges" && (data.updatedItems != null || data.updatedTotalAmountSmallestUnit != null)) // Don't allow updates if not ApprovedWithChanges
+            (data.approvalStatus === "ApprovedWithChanges" && (!Array.isArray(data.updatedItems) || data.updatedItems.length === 0)) || // Require items if changes approved
+            (data.updatedTotalAmountSmallestUnit != null && (typeof data.updatedTotalAmountSmallestUnit !== 'number' || !Number.isInteger(data.updatedTotalAmountSmallestUnit) || data.updatedTotalAmountSmallestUnit < 0))
            )
         {
             logger.error(`${functionName} Invalid input data structure or types.`, { ...logContext, data: JSON.stringify(data).substring(0,500) });
-            return { success: false, error: "error.invalidInput.structure", errorCode: ErrorCode.InvalidArgument };
+            let errorCode = ErrorCode.InvalidArgument;
+            if (data?.approvalStatus && !validApprovalStatuses.includes(data.approvalStatus)) {
+                errorCode = ErrorCode.InvalidApprovalStatus;
+            }
+            return { success: false, error: "error.invalidInput.structureOrStatus", errorCode: errorCode };
         }
-        const { bookingId, approvalStatus, adminNotes } = data;
-        const typedApprovalStatus = approvalStatus as ApprovalStatus;
+        const { bookingId, approvalStatus, adminNotes, updatedItems, updatedTotalAmountSmallestUnit } = data;
 
         // --- Variables ---
         let bookingData: EventBooking;
+        let adminUserData: User;
         let adminUserRole: string | null;
-        let nextBookingStatus: EventBookingStatus;
-        let recalculationResult: PriceCalculationResult | null = null;
+        let finalTotalAmount = updatedTotalAmountSmallestUnit; // Use provided amount if exists
+        let finalSelectedItems = updatedItems ?? null; // Use provided items if exists
+
+        // --- Firestore References ---
+        const bookingRef = db.collection('eventBookings').doc(bookingId);
+        const adminUserRef = db.collection('users').doc(adminUserId);
 
         try {
-            // Fetch Admin User Role & Booking Data Concurrently
-            const adminUserRef = db.collection('users').doc(adminUserId);
-            const bookingRef = db.collection('eventBookings').doc(bookingId);
-
+            // 3. Fetch Admin User and Booking Data Concurrently
             const [adminUserSnap, bookingSnap] = await Promise.all([adminUserRef.get(), bookingRef.get()]);
 
             // Validate Admin User
             if (!adminUserSnap.exists) throw new HttpsError('not-found', `error.user.notFound::${adminUserId}`, { errorCode: ErrorCode.UserNotFound });
-            adminUserRole = (adminUserSnap.data() as User)?.role ?? null;
+            adminUserData = adminUserSnap.data() as User;
+            adminUserRole = adminUserData.role; // Get admin role
             logContext.adminUserRole = adminUserRole;
 
-            // Validate Booking Exists
+            // Validate Booking
             if (!bookingSnap.exists) {
-                logger.warn(`${functionName} Booking ${bookingId} not found.`, logContext);
-                return { success: false, error: "error.booking.notFound", errorCode: ErrorCode.BookingNotFound };
+                logger.warn(`${functionName} Event booking ${bookingId} not found.`, logContext);
+                return { success: false, error: "error.event.bookingNotFound", errorCode: ErrorCode.BookingNotFound };
             }
             bookingData = bookingSnap.data() as EventBooking;
             logContext.currentStatus = bookingData.bookingStatus;
             logContext.customerId = bookingData.customerId;
 
-            // 3. Permission Check
-            const hasPermission = await checkPermission(adminUserId, adminUserRole, 'event:approve', { bookingId });
+            // 4. Permission Check (Using REAL helper)
+            // Admin needs permission to approve/reject events. Define: 'event:approve'
+            // Pass fetched role to checkPermission
+            const hasPermission = await checkPermission(adminUserId, adminUserRole, 'event:approve', logContext);
             if (!hasPermission) {
-                logger.warn(`${functionName} Permission denied for admin ${adminUserId}.`, logContext);
+                logger.warn(`${functionName} Permission denied for admin ${adminUserId} (Role: ${adminUserRole}) to approve/reject booking ${bookingId}.`, logContext);
                 return { success: false, error: "error.permissionDenied.approveEvent", errorCode: ErrorCode.PermissionDenied };
             }
 
-            // 4. State Validation (Must be PendingAdminApproval)
+            // 5. State Validation
             if (bookingData.bookingStatus !== EventBookingStatus.PendingAdminApproval) {
-                logger.warn(`${functionName} Booking ${bookingId} is not in PendingAdminApproval status (Current: ${bookingData.bookingStatus}).`, logContext);
-                // Idempotency: If already approved/rejected by *this* action, maybe return success?
-                // Check if adminApprovalDetails matches current request? Complex. Let's return error for now.
-                return { success: false, error: `error.booking.invalidStatus.approval::${bookingData.bookingStatus}`, errorCode: ErrorCode.InvalidBookingStatus };
-            }
-
-            // 5. Determine Next Status & Recalculate Price if needed
-            const adminApprovalDetails: AdminApprovalDetails = {
-                status: typedApprovalStatus,
-                adminUserId: adminUserId,
-                timestamp: Timestamp.now(),
-                notes: adminNotes ?? null,
-            };
-
-            if (typedApprovalStatus === "Approved" || typedApprovalStatus === "ApprovedWithChanges") {
-                nextBookingStatus = EventBookingStatus.PendingCustomerAgreement;
-                // If ApprovedWithChanges, use the provided updated items and total
-                if (typedApprovalStatus === "ApprovedWithChanges") {
-                    // Optional: Recalculate price server-side based on updatedItems for verification?
-                    // recalculationResult = await calculateEventPrice(data.updatedItems!, bookingData.eventMenuId, bookingData.currencyCode, bookingData.durationMinutes ?? 0);
-                    // if (recalculationResult.error || recalculationResult.totalAmountSmallestUnit !== data.updatedTotalAmountSmallestUnit) {
-                    //     logger.error("Server recalculation mismatch or failed.", { clientTotal: data.updatedTotalAmountSmallestUnit, serverCalc: recalculationResult });
-                    //     throw new HttpsError('internal', "Price recalculation mismatch.", { errorCode: ErrorCode.CalculationError });
-                    // }
-                    // For now, trust the admin input if provided correctly
-                    if (!data.updatedItems || data.updatedTotalAmountSmallestUnit == null) {
-                         throw new HttpsError('invalid-argument', "Missing updatedItems or updatedTotalAmount for ApprovedWithChanges."); // Should be caught by validation
-                    }
+                logger.warn(`${functionName} Event booking ${bookingId} is not in 'PendingAdminApproval' status (current: ${bookingData.bookingStatus}). Cannot approve/reject.`, logContext);
+                // Handle cases where it might already be approved/rejected - maybe return success?
+                if (bookingData.bookingStatus === EventBookingStatus.PendingCustomerConfirmation || bookingData.bookingStatus === EventBookingStatus.Rejected) {
+                     logger.info(`${functionName} Booking ${bookingId} already processed (status: ${bookingData.bookingStatus}). Assuming idempotent call.`, logContext);
+                     return { success: true }; // Idempotency
                 }
-            } else { // Rejected
-                nextBookingStatus = EventBookingStatus.CancelledByAdmin;
+                return { success: false, error: `error.event.invalidStatus.approve::${bookingData.bookingStatus}`, errorCode: ErrorCode.InvalidBookingStatus };
             }
-            logContext.nextStatus = nextBookingStatus;
 
-            // 6. Update Booking Document
-            logger.info(`${functionName} Updating booking ${bookingId} status to ${nextBookingStatus}...`, logContext);
-            const updateData: Partial<EventBooking> & { updatedAt: admin.firestore.FieldValue } = {
-                bookingStatus: nextBookingStatus,
-                adminApprovalDetails: adminApprovalDetails,
+            // 6. Handle 'ApprovedWithChanges' - Recalculate total if not provided explicitly
+            if (approvalStatus === "ApprovedWithChanges") {
+                if (!finalSelectedItems) { // Should have been caught by validation, but double-check
+                     throw new HttpsError('invalid-argument', "updatedItems are required for 'ApprovedWithChanges'.");
+                }
+                // If total amount wasn't provided, recalculate based on updatedItems
+                if (finalTotalAmount == null) {
+                    logger.info(`${functionName} Recalculating total for approved changes...`, logContext);
+                    // Need event settings and potentially menu for recalculation
+                    const settingsRef = db.collection('appConfig').doc('eventSettings');
+                    const menuRef = bookingData.eventMenuId ? db.collection('menus').doc(bookingData.eventMenuId) : null;
+                    const [settingsSnap, menuSnap] = await Promise.all([
+                        settingsRef.get(),
+                        menuRef ? menuRef.get() : Promise.resolve(null)
+                    ]);
+                    if (!settingsSnap.exists) throw new HttpsError('internal', "Event settings configuration not found.", { errorCode: ErrorCode.ConfigNotFound });
+                    const eventSettings = settingsSnap.data() as AppConfigEventSettings;
+                    let menuData: Menu | null = null;
+                    if (menuRef && menuSnap && menuSnap.exists) menuData = menuSnap.data() as Menu;
+                    else if (menuRef) throw new HttpsError('not-found', `Original menu ${bookingData.eventMenuId} not found for recalculation.`);
+
+                    const recalcResult = calculateEventTotal(finalSelectedItems, menuData, eventSettings);
+                    if (recalcResult.error) throw new HttpsError('internal', `Recalculation Error: ${recalcResult.error}`, { errorCode: ErrorCode.CalculationError });
+                    if (!recalcResult.minOrderRequirementMet) {
+                         logger.warn(`${functionName} Changes result in minimum order requirement not met.`, { ...logContext, newTotal: recalcResult.totalAmount });
+                         return { success: false, error: "error.event.minOrderNotMetAfterChanges", errorCode: ErrorCode.MinOrderNotMet };
+                    }
+                    finalTotalAmount = recalcResult.totalAmount;
+                    logContext.recalculatedTotal = finalTotalAmount;
+                } else {
+                    logContext.providedTotal = finalTotalAmount;
+                }
+                 // Ensure final amount is valid after potential recalculation or if provided
+                 if (finalTotalAmount == null || finalTotalAmount < 0) {
+                     throw new HttpsError('internal', "Invalid final total amount after changes.");
+                 }
+            }
+
+            // 7. Determine New Booking Status and Prepare Update Data
+            const now = Timestamp.now();
+            let newStatus: EventBookingStatus;
+            let updateData: { [key: string]: any } = {
+                adminApprovalDetails: {
+                    status: approvalStatus,
+                    adminUserId: adminUserId,
+                    timestamp: now,
+                    notes: adminNotes ?? null,
+                },
                 updatedAt: FieldValue.serverTimestamp(),
                 processingError: null, // Clear previous errors
             };
 
-            // If approved with changes, update items and total
-            if (typedApprovalStatus === "ApprovedWithChanges" && data.updatedItems && data.updatedTotalAmountSmallestUnit != null) {
-                // Ensure bookingItemId exists for each updated item (or generate)
-                const finalUpdatedItems = data.updatedItems.map(item => ({
-                    ...item,
-                    bookingItemId: item.bookingItemId || uuidv4(),
-                }));
-                updateData.selectedItems = finalUpdatedItems;
-                updateData.totalAmountSmallestUnit = data.updatedTotalAmountSmallestUnit;
-                // Recalculate minOrderRequirementMet based on new total?
-                const minOrderValue = (await fetchEventSettings())?.minOrderValueSmallestUnit?.[bookingData.currencyCode] ?? 0;
-                updateData.minOrderRequirementMet = data.updatedTotalAmountSmallestUnit >= minOrderValue;
+            if (approvalStatus === "Approved" || approvalStatus === "ApprovedWithChanges") {
+                newStatus = EventBookingStatus.PendingCustomerConfirmation;
+                updateData.bookingStatus = newStatus;
+                // If approved with changes, update items and total amount
+                if (approvalStatus === "ApprovedWithChanges") {
+                    updateData.selectedItems = finalSelectedItems; // Already validated to exist
+                    updateData.totalAmountSmallestUnit = finalTotalAmount; // Already validated > 0
+                }
+                // Set agreement sent timestamp? Or handle sending agreement separately? Let's set it here.
+                updateData.agreementSentTimestamp = now;
+            } else { // Rejected
+                newStatus = EventBookingStatus.Rejected;
+                updateData.bookingStatus = newStatus;
+                // Payment status remains Pending or potentially Cancelled? Let's keep Pending.
             }
+            logContext.newStatus = newStatus;
 
+            // Add status history entry
+            updateData.statusChangeHistory = FieldValue.arrayUnion({
+                from: bookingData.bookingStatus,
+                to: newStatus,
+                timestamp: now,
+                userId: adminUserId,
+                role: adminUserRole,
+                reason: `Admin ${approvalStatus}${adminNotes ? `: ${adminNotes}` : ''}`
+            });
+
+            // 8. Update Booking Document in Firestore
+            logger.info(`${functionName} Updating event booking ${bookingId} status to ${newStatus}...`, logContext);
             await bookingRef.update(updateData);
-            logger.info(`${functionName} Booking ${bookingId} updated successfully.`);
+            logger.info(`${functionName} Booking ${bookingId} updated successfully.`, logContext);
 
-            // 7. Trigger Notifications (Async)
-            const notificationPromises: Promise<void>[] = [];
-             // Notify Customer about the decision
-             let customerNotificationType: string;
-             let customerTitleKey: string;
-             let customerMessageKey: string;
-             const customerMessageParams: any = { bookingIdShort: bookingId.substring(0, 6) };
-
-             if (typedApprovalStatus === "Approved") {
-                 customerNotificationType = "EventBookingApproved";
-                 customerTitleKey = "notification.eventApproved.title";
-                 customerMessageKey = "notification.eventApproved.message";
-             } else if (typedApprovalStatus === "ApprovedWithChanges") {
-                 customerNotificationType = "EventBookingApprovedWithChanges";
-                 customerTitleKey = "notification.eventApprovedChanges.title";
-                 customerMessageKey = "notification.eventApprovedChanges.message";
-                 customerMessageParams.reason = adminNotes ?? "Details updated.";
-             } else { // Rejected
-                 customerNotificationType = "EventBookingRejected";
-                 customerTitleKey = "notification.eventRejected.title";
-                 customerMessageKey = "notification.eventRejected.message";
-                 customerMessageParams.reason = adminNotes ?? "Booking could not be confirmed.";
-             }
-
-             if (bookingData.customerId) {
-                 notificationPromises.push(sendPushNotification({
-                     userId: bookingData.customerId, type: customerNotificationType, langPref: bookingData.customerLanguagePref, // Need to fetch customer lang pref
-                     titleKey: customerTitleKey, messageKey: customerMessageKey,
-                     messageParams: customerMessageParams,
-                     payload: { bookingId: bookingId, screen: 'EventDetails' } // Navigate to event details
-                 }).catch(err => logger.error("Failed sending customer event approval notification", { err })) );
-             }
-            Promise.allSettled(notificationPromises);
+            // 9. Send Notification to Customer (Async)
+            // Use different notifications based on approval status
+            let notificationType: string;
+            let titleKey: string;
+            let messageKey: string;
+            if (newStatus === EventBookingStatus.PendingCustomerConfirmation) {
+                 notificationType = "EventApproved";
+                 titleKey = "notification.eventApproved.title";
+                 messageKey = approvalStatus === "ApprovedWithChanges" ? "notification.eventApproved.messageChanges" : "notification.eventApproved.message";
+            } else { // Rejected
+                 notificationType = "EventRejected";
+                 titleKey = "notification.eventRejected.title";
+                 messageKey = "notification.eventRejected.message";
+            }
+            sendPushNotification({
+                 userId: bookingData.customerId,
+                 type: notificationType,
+                 titleKey: titleKey,
+                 messageKey: messageKey,
+                 messageParams: { bookingId: bookingId, adminNotes: adminNotes ?? "" }, // Pass notes if available
+                 payload: { bookingId: bookingId, screen: 'eventDetails' } // Navigate user to booking
+            }).catch(err => logger.error("Failed sending customer notification", { err }));
 
 
-            // 8. Log Admin Action (Async)
-            logAdminAction("ApproveEventBooking", { bookingId, customerId: bookingData.customerId, approvalStatus: typedApprovalStatus, adminNotes, updatedItemsProvided: !!data.updatedItems, triggerUserId: adminUserId })
-                .catch(err => logger.error("Failed logging admin action", { err }));
+            // 10. Log Admin Action (Async)
+            logAdminAction("ApproveEventBooking", {
+                bookingId, customerId: bookingData.customerId, decision: approvalStatus,
+                notes: adminNotes, updatedItems: approvalStatus === "ApprovedWithChanges" ? updatedItems : null,
+                updatedTotal: approvalStatus === "ApprovedWithChanges" ? finalTotalAmount : null,
+                triggerUserId: adminUserId, triggerUserRole: adminUserRole
+            }).catch(err => logger.error("Failed logging admin action", { err }));
 
-            // 9. Return Success
+            // 11. Return Success
             return { success: true };
 
         } catch (error: any) {
             // Error Handling
             logger.error(`${functionName} Execution failed.`, { ...logContext, error: error?.message, details: error?.details });
             const isHttpsError = error instanceof HttpsError;
-            const code = isHttpsError ? error.code : 'UNKNOWN';
             let finalErrorCode: ErrorCode = ErrorCode.InternalError;
             let finalErrorMessageKey: string = "error.internalServer";
 
             if (isHttpsError) {
                 finalErrorCode = (error.details as any)?.errorCode as ErrorCode || ErrorCode.InternalError;
                 finalErrorMessageKey = error.message.startsWith("error.") ? error.message : `error.approveEvent.generic`;
-                if (!Object.values(ErrorCode).includes(finalErrorCode)) finalErrorCode = ErrorCode.InternalError;
+                 if (!Object.values(ErrorCode).includes(finalErrorCode)) finalErrorCode = ErrorCode.InternalError;
                  if (error.message.includes("::")) { finalErrorMessageKey = error.message; }
             }
+            // No transaction errors expected here unless DB fails
 
-            // Log failure
-            logAdminAction("ApproveEventBookingFailed", { inputData: data, triggerUserId: adminUserId, errorMessage: error.message, finalErrorCode }).catch(...)
+            logAdminAction("ApproveEventBookingFailed", { bookingId, approvalStatus, error: error.message, triggerUserId: adminUserId }).catch(...)
 
             return { success: false, error: finalErrorMessageKey, errorCode: finalErrorCode };
         } finally {
