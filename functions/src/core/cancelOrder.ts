@@ -57,7 +57,7 @@ export const cancelOrder = functions.https.onCall(
         // secrets: ["PAYMENT_GATEWAY_SECRET"], // Uncomment if payment helper needs secrets
     },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[cancelOrder V3 - Permissions]";
+        const functionName = "[cancelOrder V3 - Permissions]"; // Updated version name
         const startTimeFunc = Date.now();
 
         // 1. Authentication & Authorization
@@ -135,7 +135,7 @@ export const cancelOrder = functions.https.onCall(
                  return { success: false, error: "error.order.alreadyCancelled", errorCode: ErrorCode.FailedPrecondition };
             }
 
-            // 6. Handle Payment Void/Refund (if applicable)
+            // 6. Handle Payment Void/Refund (if applicable) - Logic remains the same as V2
             updatedPaymentStatus = orderData.paymentStatus;
 
             if (orderData.paymentStatus === PaymentStatus.Authorized) {
@@ -183,7 +183,7 @@ export const cancelOrder = functions.https.onCall(
             }
             logContext.updatedPaymentStatus = updatedPaymentStatus;
 
-            // 7. Firestore Transaction to Update Order Status
+            // 7. Firestore Transaction to Update Order Status - Logic remains the same as V2
             logger.info(`${functionName} Starting Firestore transaction to update order status...`, logContext);
             await db.runTransaction(async (transaction) => {
                 const orderTxSnap = await transaction.get(orderRef);
@@ -223,7 +223,7 @@ export const cancelOrder = functions.https.onCall(
             });
             logger.info(`${functionName} Order ${orderId} status updated to Cancelled successfully.`, logContext);
 
-            // 8. Log Action (Async)
+            // 8. Log Action (Async) - Logic remains the same as V2
             const logDetails = { orderId, customerId: orderData.customerId, cancelledBy: userId, userRole, reason, initialStatus: orderData.status, finalPaymentStatus: updatedPaymentStatus };
             if (isAdmin) {
                 logAdminAction("CancelOrder", logDetails).catch(err => logger.error("Failed logging admin action", { err }));
@@ -231,11 +231,11 @@ export const cancelOrder = functions.https.onCall(
                 logUserActivity("CancelOrder", logDetails, userId).catch(err => logger.error("Failed logging user activity", { err }));
             }
 
-            // 9. Return Success
+            // 9. Return Success - Logic remains the same as V2
             return { success: true };
 
         } catch (error: any) {
-            // Error Handling
+            // Error Handling - Logic remains the same as V2
             logger.error(`${functionName} Execution failed.`, { ...logContext, error: error?.message, details: error?.details });
             const isHttpsError = error instanceof HttpsError;
             let finalErrorCode: ErrorCode = ErrorCode.InternalError;
