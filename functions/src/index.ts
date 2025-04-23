@@ -38,6 +38,9 @@ import { assignEventResources } from './events/assignEventResources';
 import { updateEventStatus } from './events/updateEventStatus';
 import { cancelEventBooking as cancelEventBookingEvent } from './events/cancelEventBooking';
 
+// --- Import Courier Functions ---
+import { startShift } from './courier/startShift'; // <-- שורה חדשה
+
 // --- Import RBAC Functions ---
 import { createRole, updateRole, deleteRole, listRoles } from './rbac/manageRoles';
 import { listPermissions, assignRoleToUser } from './rbac/managePermissionsUsers';
@@ -49,7 +52,7 @@ import { createPromoCode, updatePromoCode, deletePromoCode, listPromoCodes } fro
 // --- Import Scheduled Functions ---
 import { autoCancelExpiredOrders, deactivateExpiredPromotions, cleanupOldLogs } from './scheduled/scheduledFunctions'; // Background
 import { calculateVipTiers } from './scheduled/calculateVipTiers';
-import { generateDailySalesReport } from './scheduled/generateDailySalesReport'; // <-- שורה חדשה
+import { generateDailySalesReport } from './scheduled/generateDailySalesReport';
 
 // --- Import Auth Functions ---
 import { sendOtp } from './auth/sendOtp';
@@ -85,6 +88,8 @@ export {
   assignEventResources,
   updateEventStatus,
   cancelEventBookingEvent, // Event cancellation
+  // Courier
+  startShift, // <-- שורה חדשה
   // RBAC
   createRole,
   updateRole,
@@ -117,7 +122,7 @@ deactivateExpiredPromotions;
 cleanupOldLogs;
 handleOrderCancellationSideEffects;
 calculateVipTiers;
-generateDailySalesReport; // <-- שורה חדשה
+generateDailySalesReport;
 // Note: Utility functions like logUserActivity don't need to be referenced here
 // as they are imported and used by other functions.
 // ... add references for other background/triggered functions ...
