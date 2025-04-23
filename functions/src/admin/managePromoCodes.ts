@@ -6,12 +6,11 @@ import { HttpsError } from "firebase-functions/v2/https";
 // --- Import Models ---
 import { User, PromoCode } from '../models'; // Adjust path if needed
 
-// --- Assuming helper functions are imported or defined elsewhere ---
-// import { checkPermission } from '../utils/permissions';
-// import { logAdminAction } from '../utils/logging';
+// --- Import Helpers ---
+import { checkPermission } from '../utils/permissions'; // <-- Import REAL helper
+// import { logAdminAction } from '../utils/logging'; // Using mock below
 
-// --- Mocks for required helper functions (Replace with actual implementations) ---
-async function checkPermission(userId: string | null, userRole: string | null, permissionId: string, context?: any): Promise<boolean> { logger.info(`[Mock Auth] Check ${permissionId} for ${userId} (${userRole})`, context); return userId != null && (userRole === 'Admin' || userRole === 'SuperAdmin'); }
+// --- Mocks for other required helper functions (Replace with actual implementations) ---
 async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); }
 // --- End Mocks ---
 
@@ -29,6 +28,7 @@ enum ErrorCode {
     InternalError = "INTERNAL_ERROR",
     // Specific codes
     PromoCodeNotFound = "PROMO_CODE_NOT_FOUND",
+    UserNotFound = "USER_NOT_FOUND", // Added
     InvalidDiscountDetails = "INVALID_DISCOUNT_DETAILS",
     InvalidDateRange = "INVALID_DATE_RANGE",
 }
@@ -89,6 +89,8 @@ interface PromoCodeOutput extends Omit<PromoCode, 'createdAt' | 'updatedAt' | 'v
     updatedAt?: string | null;
     validFrom?: string | null;
     validUntil?: string | null;
+    // Add couponCode explicitly if not part of PromoCode model by default
+    couponCode: string;
 }
 
 interface ListPromoCodesOutput {
@@ -126,7 +128,7 @@ function parseOptionalTimestamp(dateString: string | null | undefined): Timestam
 export const createPromoCode = functions.https.onCall(
     { region: FUNCTION_REGION, memory: "128MiB" },
     async (request): Promise<{ success: true; couponCode: string } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[createPromoCode V1]";
+        const functionName = "[createPromoCode V2 - Permissions]"; // Updated version name
         const startTimeFunc = Date.now();
 
         // 1. Auth & Permissions
@@ -139,10 +141,22 @@ export const createPromoCode = functions.https.onCall(
         let adminUserRole: string | null = null;
         try {
             const userSnap = await db.collection('users').doc(adminUserId).get();
-            if (userSnap.exists) adminUserRole = (userSnap.data() as User)?.role;
-            const hasPermission = await checkPermission(adminUserId, adminUserRole, 'admin:promocode:create');
-            if (!hasPermission) { return { success: false, error: "error.permissionDenied.createPromo", errorCode: ErrorCode.PermissionDenied }; }
-        } catch (e: any) { logger.error("Auth/Permission check failed", e); return { success: false, error: "error.internalServer", errorCode: ErrorCode.InternalError }; }
+            if (!userSnap.exists) throw new HttpsError('not-found', `Admin user ${adminUserId} not found.`, { errorCode: ErrorCode.UserNotFound });
+            adminUserRole = (userSnap.data() as User)?.role;
+            logContext.adminUserRole = adminUserRole;
+
+            // Permission Check (Using REAL helper) - Define permission: 'admin:promocode:create'
+            const hasPermission = await checkPermission(adminUserId, adminUserRole, 'admin:promocode:create', logContext);
+            if (!hasPermission) {
+                logger.warn(`${functionName} Permission denied for admin ${adminUserId} (Role: ${adminUserRole}) to create promo code.`, logContext);
+                return { success: false, error: "error.permissionDenied.createPromo", errorCode: ErrorCode.PermissionDenied };
+            }
+        } catch (e: any) {
+             logger.error("Auth/Permission check failed", { ...logContext, error: e.message });
+             const code = e instanceof HttpsError ? e.details?.errorCode : ErrorCode.InternalError;
+             const msg = e instanceof HttpsError ? e.message : "error.internalServer";
+             return { success: false, error: msg, errorCode: code || ErrorCode.InternalError };
+        }
 
         // 2. Input Validation
         if (!data?.couponCode || typeof data.couponCode !== 'string' || data.couponCode.trim().length === 0 || data.couponCode.includes('/') ||
@@ -153,7 +167,7 @@ export const createPromoCode = functions.https.onCall(
             (data.minOrderValueSmallestUnit != null && (typeof data.minOrderValueSmallestUnit !== 'number' || !Number.isInteger(data.minOrderValueSmallestUnit) || data.minOrderValueSmallestUnit < 0))
            )
         {
-            logger.error(`${functionName} Invalid input data.`, { ...logContext, data: JSON.stringify(data).substring(0,500) });
+            logger.error(`${functionName} Invalid input data structure or types.`, { ...logContext, data: JSON.stringify(data).substring(0,500) });
             return { success: false, error: "error.invalidInput.promoData", errorCode: ErrorCode.InvalidArgument };
         }
 
@@ -219,7 +233,7 @@ export const createPromoCode = functions.https.onCall(
 export const updatePromoCode = functions.https.onCall(
     { region: FUNCTION_REGION, memory: "128MiB" },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[updatePromoCode V1]";
+        const functionName = "[updatePromoCode V2 - Permissions]"; // Updated version name
         const startTimeFunc = Date.now();
 
         // 1. Auth & Permissions
@@ -232,10 +246,22 @@ export const updatePromoCode = functions.https.onCall(
         let adminUserRole: string | null = null;
         try {
             const userSnap = await db.collection('users').doc(adminUserId).get();
-            if (userSnap.exists) adminUserRole = (userSnap.data() as User)?.role;
-            const hasPermission = await checkPermission(adminUserId, adminUserRole, 'admin:promocode:update');
-            if (!hasPermission) { return { success: false, error: "error.permissionDenied.updatePromo", errorCode: ErrorCode.PermissionDenied }; }
-        } catch (e: any) { logger.error("Auth/Permission check failed", e); return { success: false, error: "error.internalServer", errorCode: ErrorCode.InternalError }; }
+            if (!userSnap.exists) throw new HttpsError('not-found', `Admin user ${adminUserId} not found.`, { errorCode: ErrorCode.UserNotFound });
+            adminUserRole = (userSnap.data() as User)?.role;
+            logContext.adminUserRole = adminUserRole;
+
+            // Permission Check (Using REAL helper) - Define permission: 'admin:promocode:update'
+            const hasPermission = await checkPermission(adminUserId, adminUserRole, 'admin:promocode:update', logContext);
+            if (!hasPermission) {
+                logger.warn(`${functionName} Permission denied for admin ${adminUserId} (Role: ${adminUserRole}) to update promo code.`, logContext);
+                return { success: false, error: "error.permissionDenied.updatePromo", errorCode: ErrorCode.PermissionDenied };
+            }
+        } catch (e: any) {
+             logger.error("Auth/Permission check failed", { ...logContext, error: e.message });
+             const code = e instanceof HttpsError ? e.details?.errorCode : ErrorCode.InternalError;
+             const msg = e instanceof HttpsError ? e.message : "error.internalServer";
+             return { success: false, error: msg, errorCode: code || ErrorCode.InternalError };
+        }
 
         // 2. Input Validation
         if (!data?.couponCode || typeof data.couponCode !== 'string' || data.couponCode.trim().length === 0) {
@@ -258,11 +284,28 @@ export const updatePromoCode = functions.https.onCall(
         if (data.discountDetails !== undefined) { if(!validateDiscountDetails(data.discountDetails)) return {success: false, error:"Invalid discountDetails", errorCode: ErrorCode.InvalidDiscountDetails}; updatePayload.discountDetails = data.discountDetails; changesDetected = true; }
         if (data.minOrderValueSmallestUnit !== undefined) { if(data.minOrderValueSmallestUnit !== null && (typeof data.minOrderValueSmallestUnit !== 'number' || !Number.isInteger(data.minOrderValueSmallestUnit) || data.minOrderValueSmallestUnit < 0)) return {success: false, error:"Invalid minOrderValue", errorCode: ErrorCode.InvalidArgument}; updatePayload.minOrderValueSmallestUnit = data.minOrderValueSmallestUnit; changesDetected = true; }
 
-        // Validate date range consistency if both are being updated
-        const finalValidFrom = updatePayload.validFrom ?? (await db.collection('promoCodes').doc(couponCodeId).get()).data()?.validFrom ?? null;
-        const finalValidUntil = updatePayload.validUntil ?? (await db.collection('promoCodes').doc(couponCodeId).get()).data()?.validUntil ?? null;
-        if (finalValidFrom && finalValidUntil && finalValidUntil <= finalValidFrom) {
-            return { success: false, error: "error.invalidInput.dateRange", errorCode: ErrorCode.InvalidDateRange };
+        // Validate date range consistency if both are being updated or one is updated and the other exists
+        let finalValidFromTs: Timestamp | null = null;
+        let finalValidUntilTs: Timestamp | null = null;
+        const promoRef = db.collection('promoCodes').doc(couponCodeId); // Define here for reuse
+
+        try {
+            const currentSnap = await promoRef.get();
+            if (!currentSnap.exists && changesDetected) { // Only error if trying to update non-existent and there are changes
+                 logger.warn(`${functionName} Promo code '${couponCodeId}' not found for update.`, logContext);
+                 return { success: false, error: "error.promo.notFound", errorCode: ErrorCode.PromoCodeNotFound };
+            }
+            const currentData = currentSnap.data();
+
+            finalValidFromTs = updatePayload.validFrom !== undefined ? updatePayload.validFrom : (currentData?.validFrom ?? null);
+            finalValidUntilTs = updatePayload.validUntil !== undefined ? updatePayload.validUntil : (currentData?.validUntil ?? null);
+
+            if (finalValidFromTs && finalValidUntilTs && finalValidUntilTs <= finalValidFromTs) {
+                return { success: false, error: "error.invalidInput.dateRange", errorCode: ErrorCode.InvalidDateRange };
+            }
+        } catch (fetchError: any) {
+             logger.error(`${functionName} Failed to fetch current promo code data for validation.`, { ...logContext, error: fetchError.message });
+             return { success: false, error: "error.internalServer", errorCode: ErrorCode.InternalError };
         }
 
 
@@ -274,9 +317,8 @@ export const updatePromoCode = functions.https.onCall(
         updatePayload.updatedAt = FieldValue.serverTimestamp(); // Add timestamp
 
         // 3. Update Promo Code Document
-        const promoRef = db.collection('promoCodes').doc(couponCodeId);
         try {
-            await promoRef.update(updatePayload);
+            await promoRef.update(updatePayload); // update() throws if doc doesn't exist
             logger.info(`${functionName} Promo code '${couponCodeId}' updated successfully.`, logContext);
 
             // 4. Log Admin Action (Async)
@@ -286,9 +328,11 @@ export const updatePromoCode = functions.https.onCall(
             return { success: true };
 
         } catch (error: any) {
-            if (error.code === 5) { // Firestore NOT_FOUND code
-                logger.warn(`${functionName} Promo code '${couponCodeId}' not found for update.`, logContext);
-                return { success: false, error: "error.promo.notFound", errorCode: ErrorCode.PromoCodeNotFound };
+            // Error code 5 is NOT_FOUND, should have been caught above if trying to update non-existent.
+            // If it occurs here, it might be a race condition or other issue.
+            if (error.code === 5) {
+                 logger.error(`${functionName} Promo code '${couponCodeId}' not found during update operation (unexpected).`, logContext);
+                 return { success: false, error: "error.promo.notFound", errorCode: ErrorCode.PromoCodeNotFound };
             }
             logger.error(`${functionName} Failed to update promo code '${couponCodeId}'.`, { ...logContext, error: error.message });
             return { success: false, error: "error.internalServer", errorCode: ErrorCode.InternalError };
@@ -303,11 +347,11 @@ export const updatePromoCode = functions.https.onCall(
 // === Delete Promo Code Function =============================================
 // ============================================================================
 // Note: Instead of deleting, we often just mark as inactive.
-// Let's implement marking as inactive. A true delete function could be added if needed.
+// This implementation marks as inactive.
 export const deletePromoCode = functions.https.onCall(
     { region: FUNCTION_REGION, memory: "128MiB" },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[deletePromoCode (Deactivate) V1]";
+        const functionName = "[deletePromoCode (Deactivate) V2 - Permissions]"; // Updated version name
         const startTimeFunc = Date.now();
 
         // 1. Auth & Permissions
@@ -320,10 +364,22 @@ export const deletePromoCode = functions.https.onCall(
         let adminUserRole: string | null = null;
         try {
             const userSnap = await db.collection('users').doc(adminUserId).get();
-            if (userSnap.exists) adminUserRole = (userSnap.data() as User)?.role;
-            const hasPermission = await checkPermission(adminUserId, adminUserRole, 'admin:promocode:delete'); // Or a separate 'deactivate' permission
-            if (!hasPermission) { return { success: false, error: "error.permissionDenied.deletePromo", errorCode: ErrorCode.PermissionDenied }; }
-        } catch (e: any) { logger.error("Auth/Permission check failed", e); return { success: false, error: "error.internalServer", errorCode: ErrorCode.InternalError }; }
+            if (!userSnap.exists) throw new HttpsError('not-found', `Admin user ${adminUserId} not found.`, { errorCode: ErrorCode.UserNotFound });
+            adminUserRole = (userSnap.data() as User)?.role;
+            logContext.adminUserRole = adminUserRole;
+
+            // Permission Check (Using REAL helper) - Define permission: 'admin:promocode:delete'
+            const hasPermission = await checkPermission(adminUserId, adminUserRole, 'admin:promocode:delete', logContext);
+            if (!hasPermission) {
+                logger.warn(`${functionName} Permission denied for admin ${adminUserId} (Role: ${adminUserRole}) to delete/deactivate promo code.`, logContext);
+                return { success: false, error: "error.permissionDenied.deletePromo", errorCode: ErrorCode.PermissionDenied };
+            }
+        } catch (e: any) {
+             logger.error("Auth/Permission check failed", { ...logContext, error: e.message });
+             const code = e instanceof HttpsError ? e.details?.errorCode : ErrorCode.InternalError;
+             const msg = e instanceof HttpsError ? e.message : "error.internalServer";
+             return { success: false, error: msg, errorCode: code || ErrorCode.InternalError };
+        }
 
         // 2. Input Validation
         if (!data?.couponCode || typeof data.couponCode !== 'string' || data.couponCode.trim().length === 0) {
@@ -355,8 +411,9 @@ export const deletePromoCode = functions.https.onCall(
             return { success: true };
 
         } catch (error: any) {
-             if (error.code === 5) { // Firestore NOT_FOUND code (should be caught above)
-                 logger.warn(`${functionName} Promo code '${couponCodeId}' not found during update.`, logContext);
+             // update() can throw NOT_FOUND if doc deleted between get() and update()
+             if (error.code === 5) {
+                 logger.warn(`${functionName} Promo code '${couponCodeId}' not found during update (race condition?).`, logContext);
                  return { success: false, error: "error.promo.notFound", errorCode: ErrorCode.PromoCodeNotFound };
              }
             logger.error(`${functionName} Failed to deactivate promo code '${couponCodeId}'.`, { ...logContext, error: error.message });
@@ -374,7 +431,7 @@ export const deletePromoCode = functions.https.onCall(
 export const listPromoCodes = functions.https.onCall(
     { region: FUNCTION_REGION, memory: "128MiB" },
     async (request): Promise<{ success: true; data: ListPromoCodesOutput } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[listPromoCodes V1]";
+        const functionName = "[listPromoCodes V2 - Permissions]"; // Updated version name
         const startTimeFunc = Date.now();
 
         // 1. Auth & Permissions
@@ -387,10 +444,22 @@ export const listPromoCodes = functions.https.onCall(
         let adminUserRole: string | null = null;
         try {
             const userSnap = await db.collection('users').doc(adminUserId).get();
-            if (userSnap.exists) adminUserRole = (userSnap.data() as User)?.role;
-            const hasPermission = await checkPermission(adminUserId, adminUserRole, 'admin:promocode:list');
-            if (!hasPermission) { return { success: false, error: "error.permissionDenied.listPromos", errorCode: ErrorCode.PermissionDenied }; }
-        } catch (e: any) { logger.error("Auth/Permission check failed", e); return { success: false, error: "error.internalServer", errorCode: ErrorCode.InternalError }; }
+            if (!userSnap.exists) throw new HttpsError('not-found', `Admin user ${adminUserId} not found.`, { errorCode: ErrorCode.UserNotFound });
+            adminUserRole = (userSnap.data() as User)?.role;
+            logContext.adminUserRole = adminUserRole;
+
+            // Permission Check (Using REAL helper) - Define permission: 'admin:promocode:list'
+            const hasPermission = await checkPermission(adminUserId, adminUserRole, 'admin:promocode:list', logContext);
+            if (!hasPermission) {
+                logger.warn(`${functionName} Permission denied for admin ${adminUserId} (Role: ${adminUserRole}) to list promo codes.`, logContext);
+                return { success: false, error: "error.permissionDenied.listPromos", errorCode: ErrorCode.PermissionDenied };
+            }
+        } catch (e: any) {
+             logger.error("Auth/Permission check failed", { ...logContext, error: e.message });
+             const code = e instanceof HttpsError ? e.details?.errorCode : ErrorCode.InternalError;
+             const msg = e instanceof HttpsError ? e.message : "error.internalServer";
+             return { success: false, error: msg, errorCode: code || ErrorCode.InternalError };
+        }
 
         // 2. Prepare Query
         const pageSize = (typeof data?.pageSize === 'number' && data.pageSize > 0 && data.pageSize <= 100) ? data.pageSize : 20;
@@ -409,7 +478,7 @@ export const listPromoCodes = functions.https.onCall(
             try {
                 query = query.startAfter(data.pageToken);
             } catch (e) {
-                logger.warn("Invalid page token provided", { pageToken: data.pageToken });
+                logger.warn("Invalid page token provided or query failed.", { pageToken: data.pageToken, error: e });
             }
         }
 
@@ -421,11 +490,19 @@ export const listPromoCodes = functions.https.onCall(
                 const data = doc.data() as PromoCode;
                 // Convert Timestamps to ISO strings for client compatibility
                 const outputData: PromoCodeOutput = {
-                    ...data,
-                    createdAt: data.createdAt?.toDate().toISOString() ?? null,
-                    updatedAt: data.updatedAt?.toDate().toISOString() ?? null,
+                    couponCode: doc.id, // Use doc ID as the couponCode
+                    description: data.description,
+                    isActive: data.isActive,
                     validFrom: data.validFrom?.toDate().toISOString() ?? null,
                     validUntil: data.validUntil?.toDate().toISOString() ?? null,
+                    maxTotalUses: data.maxTotalUses,
+                    currentTotalUses: data.currentTotalUses,
+                    maxUsesPerUser: data.maxUsesPerUser,
+                    allowCombining: data.allowCombining,
+                    discountDetails: data.discountDetails,
+                    minOrderValueSmallestUnit: data.minOrderValueSmallestUnit,
+                    createdAt: data.createdAt?.toDate().toISOString() ?? null,
+                    updatedAt: data.updatedAt?.toDate().toISOString() ?? null,
                 };
                 promoCodes.push(outputData);
             });
