@@ -4,23 +4,14 @@ import * as admin from "firebase-admin";
 import { HttpsError } from "firebase-functions/v2/https";
 
 // --- Import Models ---
-import {
-    User, RentalBooking, RentalBookingStatus
-} from '../models'; // Adjust path if needed
+import { User, RentalBooking, RentalBookingStatus } from '../models'; // Adjust path if needed
 
-// --- Assuming helper functions are imported or defined elsewhere ---
-// import { checkPermission } from '../utils/permissions';
-// import { sendPushNotification } from '../utils/notifications';
-// import { logUserActivity, logAdminAction } from '../utils/logging';
-// import { fetchMatRentalSettings } from '../config/config_helpers';
+// --- Import Helpers ---
+import { checkPermission } from '../utils/permissions'; // <-- Import REAL helper
+// import { logUserActivity } from '../utils/logging'; // Still using mock below
 
-// --- Mocks for required helper functions (Replace with actual implementations) ---
-async function checkPermission(userId: string | null, permissionId: string, context?: any): Promise<boolean> { logger.info(`[Mock Auth] Check ${permissionId} for ${userId}`, context); return userId != null; }
-async function sendPushNotification(params: any): Promise<void> { logger.info(`[Mock Notification] Sending notification`, params); }
+// --- Mocks for other required helper functions (Replace with actual implementations) ---
 async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); }
-async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); }
-interface MatRentalSettings { defaultRentalDurationHours?: number; }
-async function fetchMatRentalSettings(): Promise<MatRentalSettings | null> { logger.info(`[Mock Config] Fetching mat rental settings`); return { defaultRentalDurationHours: 2 }; }
 // --- End Mocks ---
 
 // --- Configuration ---
@@ -28,44 +19,39 @@ async function fetchMatRentalSettings(): Promise<MatRentalSettings | null> { log
 const db = admin.firestore();
 const { FieldValue, Timestamp } = admin.firestore;
 const FUNCTION_REGION = "me-west1"; // <<<--- CHANGE TO YOUR REGION
-const DEFAULT_RENTAL_DURATION_HOURS = 2; // Default duration if not set in config
 
 // --- Enums ---
 enum ErrorCode {
     Unauthenticated = "UNAUTHENTICATED", PermissionDenied = "PERMISSION_DENIED", InvalidArgument = "INVALID_ARGUMENT",
     NotFound = "NOT_FOUND", // Booking or User not found
-    FailedPrecondition = "FAILED_PRECONDITION", // Invalid status or mismatch
+    FailedPrecondition = "FAILED_PRECONDITION", // Invalid status for pickup
+    Aborted = "ABORTED", // Transaction failed (though less likely here)
     InternalError = "INTERNAL_ERROR",
     // Specific codes
     BookingNotFound = "BOOKING_NOT_FOUND",
-    InvalidBookingStatus = "INVALID_BOOKING_STATUS", // Not AwaitingPickup or DepositAuthorized
-    CourierNotAssignedToBox = "COURIER_NOT_ASSIGNED_TO_BOX", // Courier not assigned to the pickup box
+    UserNotFound = "USER_NOT_FOUND",
+    NotCourier = "NOT_COURIER", // Added for clarity
+    InvalidBookingStatus = "INVALID_BOOKING_STATUS", // Not 'PendingPickup'
+    CourierMismatch = "COURIER_MISMATCH", // If courier needs to be assigned to the box
 }
 
 // --- Interfaces ---
 interface ConfirmRentalPickupInput {
     bookingId: string;
-    // Optional: scannedItemId could be passed to verify against booking.rentalItemId
-    // scannedItemId?: string;
+    // Optional: QR code data if scanned for confirmation?
+    // qrCodeData?: string;
 }
 
 // --- The Cloud Function ---
 export const confirmRentalPickup = functions.https.onCall(
-    {
-        region: FUNCTION_REGION,
-        memory: "256MiB",
-        timeoutSeconds: 30,
-    },
+    { region: FUNCTION_REGION, memory: "256MiB" },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[confirmRentalPickup V1]";
-        const startTime = Date.now();
+        const functionName = "[confirmRentalPickup V2 - Permissions]"; // Updated version name
+        const startTimeFunc = Date.now();
 
         // 1. Authentication & Authorization
-        if (!request.auth?.uid) {
-            logger.warn(`${functionName} Authentication failed: No UID.`);
-            return { success: false, error: "error.auth.unauthenticated", errorCode: ErrorCode.Unauthenticated };
-        }
-        const courierId = request.auth.uid; // Courier performing the pickup confirmation
+        if (!request.auth?.uid) { return { success: false, error: "error.auth.unauthenticated", errorCode: ErrorCode.Unauthenticated }; }
+        const courierId = request.auth.uid; // Courier performing the action
         const data = request.data as ConfirmRentalPickupInput;
         const logContext: any = { courierId, bookingId: data?.bookingId };
 
@@ -73,131 +59,107 @@ export const confirmRentalPickup = functions.https.onCall(
 
         // 2. Input Validation
         if (!data?.bookingId || typeof data.bookingId !== 'string') {
-            logger.error(`${functionName} Invalid input: Missing bookingId.`, logContext);
-            return { success: false, error: "error.invalidInput.bookingId", errorCode: ErrorCode.InvalidArgument };
+            logger.error(`${functionName} Invalid input data structure or types.`, { ...logContext, data: JSON.stringify(data).substring(0,500) });
+            return { success: false, error: "error.invalidInput.structure", errorCode: ErrorCode.InvalidArgument };
         }
         const { bookingId } = data;
 
-        // --- Variables ---
-        let bookingData: RentalBooking;
-        let courierData: User;
+        // --- Firestore References ---
+        const bookingRef = db.collection('rentalBookings').doc(bookingId);
+        const courierRef = db.collection('users').doc(courierId); // Needed for role check
 
         try {
-            // Fetch Courier Data (for box assignment check) & Permission Check
-            const courierRef = db.collection('users').doc(courierId);
-            const bookingRef = db.collection('rentalBookings').doc(bookingId);
-            const settingsPromise = fetchMatRentalSettings(); // Fetch settings for default duration
+            // 3. Fetch User and Booking Data Concurrently
+            const [courierSnap, bookingSnap] = await Promise.all([courierRef.get(), bookingRef.get()]);
 
-            const hasPermissionPromise = checkPermission(courierId, 'rental:confirm_pickup', { bookingId });
-
-            const [courierSnap, bookingSnap, settings, hasPermission] = await Promise.all([
-                courierRef.get(), bookingRef.get(), settingsPromise, hasPermissionPromise
-            ]);
-
-            // Validate Courier & Permission
+            // Validate User (Courier)
             if (!courierSnap.exists) throw new HttpsError('not-found', `error.user.notFound::${courierId}`, { errorCode: ErrorCode.UserNotFound });
-            courierData = courierSnap.data() as User;
-            if (courierData.role !== Role.Courier || !courierData.isActive) {
-                 throw new HttpsError('permission-denied', "error.permissionDenied.notActiveCourier", { errorCode: ErrorCode.PermissionDenied });
-            }
-            if (!hasPermission) {
-                logger.warn(`${functionName} Permission denied for courier ${courierId}.`, logContext);
-                return { success: false, error: "error.permissionDenied.confirmPickup", errorCode: ErrorCode.PermissionDenied };
+            const courierData = courierSnap.data() as User;
+            const courierRole = courierData.role; // Get role
+            logContext.userRole = courierRole;
+            if (courierRole !== 'Courier') { // Basic role check
+                 logger.warn(`${functionName} User ${courierId} is not a Courier.`, logContext);
+                 return { success: false, error: "error.permissionDenied.notCourier", errorCode: ErrorCode.NotCourier };
             }
 
             // Validate Booking
             if (!bookingSnap.exists) {
-                logger.warn(`${functionName} Booking ${bookingId} not found.`, logContext);
-                return { success: false, error: "error.booking.notFound", errorCode: ErrorCode.BookingNotFound };
+                logger.warn(`${functionName} Rental booking ${bookingId} not found.`, logContext);
+                return { success: false, error: "error.rental.bookingNotFound", errorCode: ErrorCode.BookingNotFound };
             }
-            bookingData = bookingSnap.data() as RentalBooking;
+            const bookingData = bookingSnap.data() as RentalBooking;
             logContext.currentStatus = bookingData.bookingStatus;
             logContext.pickupBoxId = bookingData.pickupBoxId;
-            logContext.customerId = bookingData.customerId;
 
-            // Validate Booking Status (Must be ready for pickup)
-            const validPickupStatuses: string[] = [
-                RentalBookingStatus.AwaitingPickup.toString(),
-                RentalBookingStatus.DepositAuthorized.toString() // Allow pickup if deposit was authorized
-            ];
-            if (!validPickupStatuses.includes(bookingData.bookingStatus)) {
-                logger.warn(`${functionName} Booking ${bookingId} has invalid status: ${bookingData.bookingStatus}. Expected AwaitingPickup or DepositAuthorized.`, logContext);
-                 // Idempotency: If already picked up, return success
-                 if (bookingData.bookingStatus === RentalBookingStatus.PickedUp) {
-                     logger.info(`${functionName} Booking ${bookingId} already marked as PickedUp. Idempotent success.`);
-                     return { success: true };
-                 }
-                return { success: false, error: `error.booking.invalidStatus.pickup::${bookingData.bookingStatus}`, errorCode: ErrorCode.InvalidBookingStatus };
+            // 4. Permission Check (Using REAL helper)
+            // Courier needs permission to confirm pickup, potentially tied to the box they are assigned to.
+            // Define permission: 'rental:pickup:confirm'
+            // Pass fetched role to checkPermission
+            const hasPermission = await checkPermission(courierId, courierRole, 'rental:pickup:confirm', logContext);
+            if (!hasPermission) {
+                logger.warn(`${functionName} Permission denied for courier ${courierId} to confirm pickup for booking ${bookingId}.`, logContext);
+                return { success: false, error: "error.permissionDenied.confirmPickup", errorCode: ErrorCode.PermissionDenied };
             }
-
-            // Validate Courier is assigned to the pickup box (using currentBoxId from shift)
+            // Additional check: Is the courier assigned to the pickup box?
             if (courierData.currentBoxId !== bookingData.pickupBoxId) {
-                 logger.error(`${functionName} Courier ${courierId} is not currently assigned to pickup box ${bookingData.pickupBoxId} (Current: ${courierData.currentBoxId}).`, logContext);
-                 return { success: false, error: "error.courier.notAtPickupBox", errorCode: ErrorCode.CourierNotAssignedToBox };
+                 logger.warn(`${functionName} Courier ${courierId} is not currently assigned to the pickup box ${bookingData.pickupBoxId} for booking ${bookingId}.`, logContext);
+                 // Decide: Allow anyway (if admin forced)? Or deny? Let's deny for now.
+                 return { success: false, error: "error.rental.courierMismatch", errorCode: ErrorCode.CourierMismatch };
             }
 
-            // 3. Update Booking Document
-            logger.info(`${functionName} Updating booking ${bookingId} to PickedUp status...`, logContext);
+
+            // 5. State Validation
+            if (bookingData.bookingStatus !== RentalBookingStatus.PendingPickup) {
+                logger.warn(`${functionName} Rental booking ${bookingId} is not in 'PendingPickup' status (current: ${bookingData.bookingStatus}). Cannot confirm pickup.`, logContext);
+                // Handle case where it might already be 'Out' - maybe return success? Or specific error?
+                if (bookingData.bookingStatus === RentalBookingStatus.Out) {
+                     logger.info(`${functionName} Booking ${bookingId} already marked as 'Out'. Assuming confirmation already happened.`, logContext);
+                     return { success: true }; // Idempotency
+                }
+                return { success: false, error: `error.rental.invalidStatus.pickup::${bookingData.bookingStatus}`, errorCode: ErrorCode.InvalidBookingStatus };
+            }
+
+            // 6. Update Booking Document
             const now = Timestamp.now();
-            const serverTimestamp = FieldValue.serverTimestamp();
-
-            // Calculate expected return time if not already set
-            let returnTimestamp = bookingData.expectedReturnTimestamp;
-            if (!returnTimestamp) {
-                const durationHours = settings?.defaultRentalDurationHours ?? DEFAULT_RENTAL_DURATION_HOURS;
-                returnTimestamp = Timestamp.fromMillis(now.toMillis() + durationHours * 60 * 60 * 1000);
-                logger.info(`Calculated expected return time: ${returnTimestamp.toDate()}`);
-            }
-
-            const updateData: Partial<RentalBooking> = {
-                bookingStatus: RentalBookingStatus.PickedUp,
+            const updateData = {
+                bookingStatus: RentalBookingStatus.Out,
                 pickupTimestamp: now,
-                pickupCourierId: courierId,
-                expectedReturnTimestamp: returnTimestamp, // Set calculated or existing
-                updatedAt: serverTimestamp,
+                pickupCourierId: courierId, // Record which courier confirmed pickup
+                updatedAt: FieldValue.serverTimestamp(),
                 processingError: null, // Clear previous errors
             };
 
+            logger.info(`${functionName} Updating booking ${bookingId} status to 'Out'...`, logContext);
             await bookingRef.update(updateData);
-            logger.info(`${functionName} Booking ${bookingId} updated successfully.`);
+            logger.info(`${functionName} Booking ${bookingId} updated successfully.`, logContext);
 
-            // 4. Trigger Notifications (Async)
-            // Notify Customer
-            if (bookingData.customerId) {
-                sendPushNotification({
-                    userId: bookingData.customerId, type: "RentalPickedUp", titleKey: "notification.rentalPickedUp.title",
-                    messageKey: "notification.rentalPickedUp.message", messageParams: { itemName: bookingData.rentalItemId }, // Use item ID if name isn't readily available
-                    payload: { bookingId: bookingId, screen: 'RentalDetails' }
-                }).catch(err => logger.error("Failed sending customer pickup notification", { err }));
-            }
-
-            // 5. Log Action (Async)
-            // Log as UserActivity since it's courier-initiated
-            logUserActivity("ConfirmRentalPickup", { bookingId, customerId: bookingData.customerId, rentalItemId: bookingData.rentalItemId }, courierId)
+            // 7. Log User Activity (Async)
+            logUserActivity("ConfirmRentalPickup", { bookingId, customerId: bookingData.customerId }, courierId)
                 .catch(err => logger.error("Failed logging user activity", { err }));
 
-            // 6. Return Success
+            // 8. Return Success
             return { success: true };
 
         } catch (error: any) {
             // Error Handling
             logger.error(`${functionName} Execution failed.`, { ...logContext, error: error?.message, details: error?.details });
             const isHttpsError = error instanceof HttpsError;
-            const code = isHttpsError ? error.code : 'UNKNOWN';
             let finalErrorCode: ErrorCode = ErrorCode.InternalError;
             let finalErrorMessageKey: string = "error.internalServer";
 
             if (isHttpsError) {
                 finalErrorCode = (error.details as any)?.errorCode as ErrorCode || ErrorCode.InternalError;
-                finalErrorMessageKey = error.message.startsWith("error.") ? error.message : `error.confirmRentalPickup.generic`;
-                if (!Object.values(ErrorCode).includes(finalErrorCode)) finalErrorCode = ErrorCode.InternalError;
-                 // Append detail if present
+                finalErrorMessageKey = error.message.startsWith("error.") ? error.message : `error.confirmPickup.generic`;
+                 if (!Object.values(ErrorCode).includes(finalErrorCode)) finalErrorCode = ErrorCode.InternalError;
                  if (error.message.includes("::")) { finalErrorMessageKey = error.message; }
             }
+            // No transaction errors expected here unless DB fails
+
+            logUserActivity("ConfirmRentalPickupFailed", { bookingId, error: error.message }, courierId).catch(...)
 
             return { success: false, error: finalErrorMessageKey, errorCode: finalErrorCode };
         } finally {
-             logger.info(`${functionName} Execution finished. Duration: ${Date.now() - startTime}ms`, logContext);
+             logger.info(`${functionName} Execution finished. Duration: ${Date.now() - startTimeFunc}ms`, logContext);
         }
     }
 );
