@@ -39,7 +39,8 @@ import { updateEventStatus } from './events/updateEventStatus';
 import { cancelEventBooking as cancelEventBookingEvent } from './events/cancelEventBooking';
 
 // --- Import Courier Functions ---
-import { startShift } from './courier/startShift'; // <-- שורה חדשה
+import { startShift } from './courier/startShift';
+import { endShift } from './courier/endShift'; // <-- שורה חדשה
 
 // --- Import RBAC Functions ---
 import { createRole, updateRole, deleteRole, listRoles } from './rbac/manageRoles';
@@ -89,7 +90,8 @@ export {
   updateEventStatus,
   cancelEventBookingEvent, // Event cancellation
   // Courier
-  startShift, // <-- שורה חדשה
+  startShift,
+  endShift, // <-- שורה חדשה
   // RBAC
   createRole,
   updateRole,
