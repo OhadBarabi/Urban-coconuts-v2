@@ -256,10 +256,10 @@ export const editOrder = functions.https.onCall(
             const logDetails = { orderId, customerId: orderData.customerId, oldItemCount: orderData.items.length, newItemCount: newOrderItems.length, oldFinalAmount: orderData.finalAmount, newFinalAmount, notesChanged: updatedNotes !== undefined, triggerUserId: userId, triggerUserRole: userRole };
             if (isAdmin) {
                 logAdminAction("EditOrder", logDetails)
-                    .catch(err => logger.error("Failed logging EditOrder admin action", { err })); // Fixed catch
+                    .catch(err => logger.error("Failed logging EditOrder admin action", { err }));
             } else {
                 logUserActivity("EditOrder", logDetails, userId)
-                    .catch(err => logger.error("Failed logging EditOrder user activity", { err })); // Fixed catch
+                    .catch(err => logger.error("Failed logging EditOrder user activity", { err }));
             }
 
             // 10. Return Success
