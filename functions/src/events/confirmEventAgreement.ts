@@ -8,30 +8,15 @@ import {
     User, EventBooking, EventBookingStatus, PaymentStatus, PaymentDetails
 } from '../models'; // Adjust path if needed
 
-// --- Assuming helper functions are imported or defined elsewhere ---
-// import { checkPermission } from '../utils/permissions';
-// import { chargePaymentMethod } from '../utils/payment_helpers'; // Payment gateway interaction
-// import { triggerCreateGoogleCalendarEvent } from '../utils/background_triggers'; // Trigger GCal creation
-// import { sendPushNotification } from '../utils/notifications';
-// import { logUserActivity, logAdminAction } from '../utils/logging';
+// --- Import Helpers ---
+import { checkPermission } from '../utils/permissions'; // <-- Import REAL helper
+import { chargePaymentMethod, extractPaymentDetailsFromResult } from '../utils/payment_helpers'; // Use charge for event deposit/payment
+// import { logUserActivity } from '../utils/logging'; // Using mock below
+// import { createGoogleCalendarEvent } from './createGoogleCalendarEvent'; // Assuming background function is triggered separately or called if needed
 
-// --- Mocks for required helper functions (Replace with actual implementations) ---
-async function checkPermission(userId: string | null, permissionId: string, context?: any): Promise<boolean> { logger.info(`[Mock Auth] Check ${permissionId} for ${userId}`, context); return userId != null; }
-interface ChargeResult { success: boolean; transactionId?: string; error?: string; }
-async function chargePaymentMethod(customerId: string, amountSmallestUnit: number, currencyCode: string, description: string, paymentMethodToken?: string | null, paymentGatewayCustomerId?: string | null): Promise<ChargeResult> {
-    logger.info(`[Mock Payment] Charging ${amountSmallestUnit} ${currencyCode} for customer ${customerId}. Desc: ${description}. Token provided: ${!!paymentMethodToken}`);
-    await new Promise(res => setTimeout(res, 1800)); // Simulate payment processing time
-    if (Math.random() < 0.08) { // Simulate higher failure rate for charge
-        logger.error("[Mock Payment] Charge FAILED.");
-        return { success: false, error: "Mock Charge Declined/Failed" };
-    }
-    return { success: true, transactionId: `CHG_${Date.now()}` };
-}
-async function triggerCreateGoogleCalendarEvent(params: { bookingId: string }): Promise<void> { logger.info(`[Mock Trigger] Triggering GCal event creation for booking ${params.bookingId}`); }
-interface AdminAlertParams { subject: string; body: string; bookingId?: string; severity: "critical" | "warning" | "info"; }
-async function sendPushNotification(params: any): Promise<void> { logger.info(`[Mock Notification] Sending notification`, params); }
+// --- Mocks for other required helper functions (Replace with actual implementations) ---
 async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); }
-async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); }
+// createGoogleCalendarEvent is a background function, likely triggered by status change, not called directly here.
 // --- End Mocks ---
 
 // --- Configuration ---
@@ -39,46 +24,46 @@ async function logAdminAction(action: string, details: object): Promise<void> { 
 const db = admin.firestore();
 const { FieldValue, Timestamp } = admin.firestore;
 const FUNCTION_REGION = "me-west1"; // <<<--- CHANGE TO YOUR REGION
+// const EVENT_CALENDAR_TOPIC = "create-google-calendar-event"; // If triggering background func via Pub/Sub
 
 // --- Enums ---
 enum ErrorCode {
     Unauthenticated = "UNAUTHENTICATED", PermissionDenied = "PERMISSION_DENIED", InvalidArgument = "INVALID_ARGUMENT",
     NotFound = "NOT_FOUND", // Booking or User not found
     FailedPrecondition = "FAILED_PRECONDITION", // Invalid status for confirmation
-    Aborted = "ABORTED", // Payment Charge failed
+    Aborted = "ABORTED", // Transaction or Payment Charge failed
     InternalError = "INTERNAL_ERROR",
     // Specific codes
     BookingNotFound = "BOOKING_NOT_FOUND",
-    InvalidBookingStatus = "INVALID_BOOKING_STATUS", // Not PendingCustomerAgreement
+    UserNotFound = "USER_NOT_FOUND",
+    NotBookingOwner = "NOT_BOOKING_OWNER", // Only customer confirms
+    InvalidBookingStatus = "INVALID_BOOKING_STATUS", // Not 'PendingCustomerConfirmation'
     PaymentChargeFailed = "PAYMENT_CHARGE_FAILED",
-    SideEffectTriggerFailed = "SIDE_EFFECT_TRIGGER_FAILED", // GCal trigger failed
+    PaymentActionRequired = "PAYMENT_ACTION_REQUIRED",
+    // PubSubError = "PUB_SUB_ERROR", // If using Pub/Sub trigger
 }
 
 // --- Interfaces ---
 interface ConfirmEventAgreementInput {
     bookingId: string;
-    paymentMethodToken?: string | null; // Optional: Token from client-side integration (e.g., Stripe, Braintree)
-    // Optional: agreeToTerms: boolean; // Could add explicit terms agreement flag
+    paymentMethodToken?: string | null; // Optional: If payment needs a new token (e.g., first payment)
 }
 
 // --- The Cloud Function ---
 export const confirmEventAgreement = functions.https.onCall(
     {
         region: FUNCTION_REGION,
-        memory: "512MiB", // Allow memory for payment interaction
-        timeoutSeconds: 90, // Allow more time for payment processing
-        // secrets: ["PAYMENT_GATEWAY_SECRET"], // If chargePaymentMethod needs secret
+        memory: "1GiB", // Allow memory for reads/payment
+        timeoutSeconds: 120, // Increase timeout for payment processing
+        // secrets: ["PAYMENT_GATEWAY_SECRET"], // Uncomment if payment helper needs secrets
     },
-    async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[confirmEventAgreement V1]";
+    async (request): Promise<{ success: true; requiresAction?: boolean; actionUrl?: string } | { success: false; error: string; errorCode: string }> => {
+        const functionName = "[confirmEventAgreement V2 - Permissions]"; // Updated version name
         const startTimeFunc = Date.now();
 
         // 1. Authentication & Authorization
-        if (!request.auth?.uid) {
-            logger.warn(`${functionName} Authentication failed: No UID.`);
-            return { success: false, error: "error.auth.unauthenticated", errorCode: ErrorCode.Unauthenticated };
-        }
-        const customerId = request.auth.uid;
+        if (!request.auth?.uid) { return { success: false, error: "error.auth.unauthenticated", errorCode: ErrorCode.Unauthenticated }; }
+        const customerId = request.auth.uid; // Customer confirming the agreement
         const data = request.data as ConfirmEventAgreementInput;
         const logContext: any = { customerId, bookingId: data?.bookingId };
 
@@ -88,187 +73,177 @@ export const confirmEventAgreement = functions.https.onCall(
         if (!data?.bookingId || typeof data.bookingId !== 'string' ||
             (data.paymentMethodToken != null && typeof data.paymentMethodToken !== 'string'))
         {
-            logger.error(`${functionName} Invalid input: Missing bookingId or invalid token type.`, logContext);
-            return { success: false, error: "error.invalidInput.bookingIdOrToken", errorCode: ErrorCode.InvalidArgument };
+            logger.error(`${functionName} Invalid input data structure or types.`, { ...logContext, data: JSON.stringify(data).substring(0,500) });
+            return { success: false, error: "error.invalidInput.structure", errorCode: ErrorCode.InvalidArgument };
         }
         const { bookingId, paymentMethodToken } = data;
 
         // --- Variables ---
         let bookingData: EventBooking;
         let userData: User;
-        let chargeResult: ChargeResult | null = null;
-        let gcalTriggerFailed = false;
+        let chargeResult: Awaited<ReturnType<typeof chargePaymentMethod>> | null = null;
+        let paymentStatus: PaymentStatus;
+        let paymentDetails: PaymentDetails | null = null;
+
+        // --- Firestore References ---
+        const bookingRef = db.collection('eventBookings').doc(bookingId);
+        const userRef = db.collection('users').doc(customerId);
 
         try {
-            // Fetch User & Booking Data Concurrently
-            const userRef = db.collection('users').doc(customerId);
-            const bookingRef = db.collection('eventBookings').doc(bookingId);
-
+            // 3. Fetch User and Booking Data Concurrently
             const [userSnap, bookingSnap] = await Promise.all([userRef.get(), bookingRef.get()]);
 
             // Validate User
             if (!userSnap.exists) throw new HttpsError('not-found', `error.user.notFound::${customerId}`, { errorCode: ErrorCode.UserNotFound });
             userData = userSnap.data() as User;
+            logContext.userRole = userData.role; // Although likely 'Customer'
             if (!userData.isActive) throw new HttpsError('permission-denied', "error.user.inactive", { errorCode: ErrorCode.PermissionDenied });
 
-            // Validate Booking Exists
+            // Validate Booking
             if (!bookingSnap.exists) {
-                logger.warn(`${functionName} Booking ${bookingId} not found.`, logContext);
-                return { success: false, error: "error.booking.notFound", errorCode: ErrorCode.BookingNotFound };
+                logger.warn(`${functionName} Event booking ${bookingId} not found.`, logContext);
+                return { success: false, error: "error.event.bookingNotFound", errorCode: ErrorCode.BookingNotFound };
             }
             bookingData = bookingSnap.data() as EventBooking;
             logContext.currentStatus = bookingData.bookingStatus;
+            logContext.bookingCustomerId = bookingData.customerId;
             logContext.totalAmount = bookingData.totalAmountSmallestUnit;
-            logContext.currency = bookingData.currencyCode;
+            logContext.currencyCode = bookingData.currencyCode;
 
-            // 3. Ownership Check
+            // 4. Permission/Ownership Check (Using REAL helper or direct check)
+            // Only the customer who owns the booking should confirm the agreement.
             if (bookingData.customerId !== customerId) {
-                logger.error(`${functionName} User ${customerId} attempted to confirm agreement for booking ${bookingId} owned by ${bookingData.customerId}.`, logContext);
-                return { success: false, error: "error.permissionDenied.notBookingOwner", errorCode: ErrorCode.PermissionDenied };
+                 logger.error(`${functionName} User ${customerId} attempted to confirm agreement for booking ${bookingId} owned by ${bookingData.customerId}.`, logContext);
+                 return { success: false, error: "error.permissionDenied.notBookingOwner", errorCode: ErrorCode.NotBookingOwner };
             }
+            // Optional: Use checkPermission if a specific permission exists ('event:confirmAgreement:own')
+            // const hasPermission = await checkPermission(customerId, userData.role, 'event:confirmAgreement:own', logContext);
+            // if (!hasPermission) { ... return permission denied ... }
 
-            // 4. State Validation (Must be PendingCustomerAgreement)
-            if (bookingData.bookingStatus !== EventBookingStatus.PendingCustomerAgreement) {
-                logger.warn(`${functionName} Booking ${bookingId} is not in PendingCustomerAgreement status (Current: ${bookingData.bookingStatus}).`, logContext);
-                 // Idempotency: If already confirmed, return success
-                 if (bookingData.bookingStatus === EventBookingStatus.Confirmed) {
-                     logger.info(`${functionName} Booking ${bookingId} already confirmed. Idempotent success.`);
-                     return { success: true };
+
+            // 5. State Validation
+            if (bookingData.bookingStatus !== EventBookingStatus.PendingCustomerConfirmation) {
+                logger.warn(`${functionName} Event booking ${bookingId} is not in 'PendingCustomerConfirmation' status (current: ${bookingData.bookingStatus}). Cannot confirm agreement.`, logContext);
+                 // Handle cases where it might already be confirmed - maybe return success?
+                 if (bookingData.bookingStatus === EventBookingStatus.Confirmed || bookingData.bookingStatus === EventBookingStatus.Scheduled) {
+                      logger.info(`${functionName} Booking ${bookingId} already confirmed (status: ${bookingData.bookingStatus}). Assuming idempotent call.`, logContext);
+                      return { success: true }; // Idempotency
                  }
-                return { success: false, error: `error.booking.invalidStatus.confirmation::${bookingData.bookingStatus}`, errorCode: ErrorCode.InvalidBookingStatus };
+                return { success: false, error: `error.event.invalidStatus.confirm::${bookingData.bookingStatus}`, errorCode: ErrorCode.InvalidBookingStatus };
             }
 
-            // 5. Process Payment (if total amount > 0)
-            const amountToCharge = bookingData.totalAmountSmallestUnit;
-            const currencyCode = bookingData.currencyCode;
-            let finalPaymentStatus: PaymentStatus | string = bookingData.paymentStatus ?? PaymentStatus.Pending;
-            let paymentDetailsUpdate: Partial<PaymentDetails> | null = null;
-            const now = Timestamp.now();
+            // 6. Process Event Payment (Deposit or Full Amount?)
+            // Assuming full payment or first installment is charged upon agreement confirmation.
+            // Use chargePaymentMethod helper.
+            const amountToCharge = bookingData.totalAmountSmallestUnit; // Charge the full amount for now
+            paymentStatus = PaymentStatus.ChargePending; // Initial status before calling payment gateway
 
-            if (amountToCharge > 0) {
-                logger.info(`${functionName} Booking ${bookingId}: Attempting to charge ${amountToCharge} ${currencyCode}...`, logContext);
+            if (amountToCharge == null || amountToCharge <= 0) {
+                // Should not happen if validation during creation/approval worked, but handle defensively.
+                logger.warn(`${functionName} Booking ${bookingId} has zero or invalid total amount (${amountToCharge}). Marking as Paid without charge.`, logContext);
+                paymentStatus = PaymentStatus.Paid;
+            } else {
+                logger.info(`${functionName} Attempting to charge ${amountToCharge} ${bookingData.currencyCode} for event booking ${bookingId}...`, logContext);
                 chargeResult = await chargePaymentMethod(
                     customerId,
                     amountToCharge,
-                    currencyCode,
-                    `Event Booking ${bookingId}`,
-                    paymentMethodToken, // Pass token if provided
-                    userData.paymentGatewayCustomerId // Pass stored customer ID if available
+                    bookingData.currencyCode,
+                    `Payment for Event Booking ${bookingId}`,
+                    paymentMethodToken,
+                    userData.paymentGatewayCustomerId,
+                    bookingId // Link charge to booking ID
                 );
 
-                if (!chargeResult.success || !chargeResult.transactionId) {
-                    logger.error(`${functionName} Booking ${bookingId}: Payment charge FAILED.`, { ...logContext, error: chargeResult.error });
-                    // Update booking status to reflect payment failure before throwing
-                    await bookingRef.update({
-                        paymentStatus: PaymentStatus.Failed,
-                        paymentDetails: {
-                            ...(bookingData.paymentDetails ?? {}),
-                            chargeTimestamp: now,
-                            chargeSuccess: false,
-                            chargeError: chargeResult.error || 'Unknown charge error',
-                        },
-                        processingError: `Payment failed: ${chargeResult.error || 'Unknown'}`,
-                        updatedAt: FieldValue.serverTimestamp(),
-                    }).catch(err => logger.error("Failed to update booking after payment failure", {err}));
-                    throw new HttpsError('aborted', `error.payment.chargeFailed::${chargeResult.error || 'Unknown'}`, { errorCode: ErrorCode.PaymentChargeFailed });
+                paymentDetails = extractPaymentDetailsFromResult(chargeResult); // Extract details
+
+                if (!chargeResult.success || (!chargeResult.transactionId && !chargeResult.requiresAction)) {
+                    paymentStatus = PaymentStatus.ChargeFailed;
+                    logger.error(`${functionName} Event payment charge failed for booking ${bookingId}.`, { ...logContext, error: chargeResult.errorMessage, code: chargeResult.errorCode });
+                    // Update booking with failed status but don't throw error here, let the update proceed.
+                } else {
+                    paymentStatus = PaymentStatus.Paid; // Mark as Paid if successful charge
+                    logger.info(`${functionName} Event payment charge successful for booking ${bookingId}. TxID: ${chargeResult.transactionId}`, logContext);
+                    if (chargeResult.requiresAction) {
+                        paymentStatus = PaymentStatus.ChargeActionRequired;
+                        logger.warn(`${functionName} Event payment charge requires further action (e.g., 3DS).`, logContext);
+                    }
                 }
+            }
+            logContext.paymentStatus = paymentStatus;
 
-                logger.info(`${functionName} Booking ${bookingId}: Payment charge successful. TxID: ${chargeResult.transactionId}`, logContext);
-                finalPaymentStatus = PaymentStatus.Paid; // Or Captured? Use Paid for simplicity.
-                paymentDetailsUpdate = { // Prepare details for successful charge
-                    chargeTimestamp: now,
-                    chargeTransactionId: chargeResult.transactionId,
-                    chargeAmountSmallestUnit: amountToCharge,
-                    chargeSuccess: true,
-                    chargeError: null,
-                    currencyCode: currencyCode,
-                    // gatewayName: 'MockGateway' // Add if known
-                };
 
-            } else {
-                logger.info(`${functionName} Booking ${bookingId}: Total amount is 0. Skipping payment charge.`, logContext);
-                finalPaymentStatus = PaymentStatus.Paid; // Consider 0 amount as Paid
+            // 7. Update Event Booking Document
+            const now = Timestamp.now();
+            const newStatus = (paymentStatus === PaymentStatus.Paid) ? EventBookingStatus.Confirmed : // Move to Confirmed if paid
+                              (paymentStatus === PaymentStatus.ChargeActionRequired) ? EventBookingStatus.PendingPaymentAction : // Custom status? Or keep PendingCustomerConfirmation? Let's use Confirmed but rely on paymentStatus.
+                              EventBookingStatus.PendingCustomerConfirmation; // Stay pending if charge failed? Or move to a failed state? Let's keep PendingConfirmation but log error.
+
+            // Let's simplify: If payment succeeds (no action needed), status -> Confirmed.
+            // If payment requires action, status -> Confirmed, paymentStatus -> ChargeActionRequired.
+            // If payment fails, status -> PendingCustomerConfirmation, paymentStatus -> ChargeFailed.
+            let finalBookingStatus = bookingData.bookingStatus; // Default to current
+            if (paymentStatus === PaymentStatus.Paid || paymentStatus === PaymentStatus.ChargeActionRequired) {
+                 finalBookingStatus = EventBookingStatus.Confirmed;
             }
 
-            // 6. Update Booking Document
-            logger.info(`${functionName} Updating booking ${bookingId} status to Confirmed...`, logContext);
-            const updateData: Partial<EventBooking> & { updatedAt: admin.firestore.FieldValue } = {
-                bookingStatus: EventBookingStatus.Confirmed,
+            logContext.newStatus = finalBookingStatus;
+
+            const updateData: { [key: string]: any } = {
+                bookingStatus: finalBookingStatus,
                 agreementConfirmedTimestamp: now,
-                paymentStatus: finalPaymentStatus,
+                paymentStatus: paymentStatus, // Update payment status based on charge result
+                paymentDetails: paymentDetails ?? bookingData.paymentDetails, // Store new payment details
                 updatedAt: FieldValue.serverTimestamp(),
-                processingError: null, // Clear previous errors
+                statusChangeHistory: FieldValue.arrayUnion({
+                    from: bookingData.bookingStatus,
+                    to: finalBookingStatus,
+                    timestamp: now,
+                    userId: customerId,
+                    role: userData.role,
+                    reason: `Customer confirmed agreement. Payment Status: ${paymentStatus}`
+                }),
+                processingError: paymentStatus === PaymentStatus.ChargeFailed ? `Payment Charge Failed: ${chargeResult?.errorMessage ?? 'Unknown'}` : null, // Log error if charge failed
             };
-            if (paymentDetailsUpdate) {
-                 updateData.paymentDetails = { ...(bookingData.paymentDetails ?? {}), ...paymentDetailsUpdate };
-            }
 
+            logger.info(`${functionName} Updating event booking ${bookingId} status to ${finalBookingStatus} and payment status to ${paymentStatus}...`, logContext);
             await bookingRef.update(updateData);
-            logger.info(`${functionName} Booking ${bookingId} updated successfully to Confirmed.`);
+            logger.info(`${functionName} Booking ${bookingId} updated successfully.`, logContext);
 
-            // 7. Trigger Google Calendar Event Creation (Async)
-            // Check if GCal integration is enabled in settings (fetch again or pass from create?)
-            const settings = await fetchEventSettings(); // Fetch fresh settings
-            if (settings?.googleCalendarIntegrationEnabled) {
-                logger.info(`${functionName} Triggering Google Calendar event creation for booking ${bookingId}...`, logContext);
-                try {
-                    await triggerCreateGoogleCalendarEvent({ bookingId });
-                } catch (triggerError: any) {
-                     gcalTriggerFailed = true;
-                     logger.error(`${functionName} CRITICAL: Failed to trigger GCal event creation for booking ${bookingId}. Manual creation required.`, { ...logContext, error: triggerError.message });
-                     // Update booking with flag (best effort outside TX)
-                     bookingRef.update({ needsManualGcalCheck: true, processingError: `GCal creation trigger failed: ${triggerError.message}` }).catch(...);
-                     logAdminAction("GCalCreateTriggerFailed", { bookingId, reason: triggerError.message }).catch(...);
-                     // Send Admin Alert
-                     sendPushNotification({ subject: `GCal Creation Trigger FAILED - Booking ${bookingId}`, body: `Failed to trigger GCal event creation for confirmed booking ${bookingId}. Manual creation REQUIRED.`, bookingId, severity: "critical" }).catch(...);
-                     // Do NOT fail the main function for this async trigger failure.
-                }
-            } else {
-                 logger.info(`${functionName} GCal integration disabled. Skipping trigger.`);
-            }
-
-            // 8. Trigger Notifications (Async)
-            // Notify Customer of Confirmation
-            sendPushNotification({
-                userId: customerId, type: "EventBookingConfirmed", langPref: userData.preferredLanguage,
-                titleKey: "notification.eventConfirmed.title", messageKey: "notification.eventConfirmed.message",
-                messageParams: { bookingIdShort: bookingId.substring(0, 6) },
-                payload: { bookingId: bookingId, screen: 'EventDetails' }
-            }).catch(err => logger.error("Failed sending customer event confirmed notification", { err }));
-            // Notify Admin/Team? (Optional)
-            sendPushNotification({
-                topic: "admin-confirmed-events", // Or specific users
-                type: "AdminEventConfirmedNotice",
-                titleKey: "notification.adminEventConfirmed.title", messageKey: "notification.adminEventConfirmed.message",
-                messageParams: { bookingId: bookingId, customerName: userData.displayName ?? customerId },
-                payload: { bookingId: bookingId, screen: 'AdminEventDetails' }
-            }).catch(err => logger.error("Failed sending admin event confirmed notification", { err }));
-
+            // 8. Trigger Background Function for Google Calendar Event (Optional: if not triggered by status change)
+            // if (finalBookingStatus === EventBookingStatus.Confirmed) {
+            //     logger.info(`${functionName} Publishing message to ${EVENT_CALENDAR_TOPIC} for booking ${bookingId}...`, logContext);
+            //     await publishToPubSub(EVENT_CALENDAR_TOPIC, { bookingId: bookingId });
+            // }
 
             // 9. Log User Activity (Async)
-            logUserActivity("ConfirmEventAgreement", { bookingId, paymentAttempted: amountToCharge > 0, paymentSuccess: chargeResult?.success ?? (amountToCharge === 0), paymentAmount: amountToCharge, gcalTriggerFailed }, customerId)
+            logUserActivity("ConfirmEventAgreement", { bookingId, paymentStatus, totalAmount: amountToCharge }, customerId)
                 .catch(err => logger.error("Failed logging user activity", { err }));
 
-            // 10. Return Success
-            return { success: true };
+            // 10. Return Success (potentially with action required)
+            const successResponse: { success: true; requiresAction?: boolean; actionUrl?: string } = { success: true };
+            if (paymentStatus === PaymentStatus.ChargeActionRequired && chargeResult?.requiresAction) {
+                successResponse.requiresAction = true;
+                successResponse.actionUrl = chargeResult.actionUrl ?? undefined;
+            }
+            // Return success even if payment failed, as the agreement was conceptually confirmed. Client needs to check status.
+            return successResponse;
 
         } catch (error: any) {
             // Error Handling
             logger.error(`${functionName} Execution failed.`, { ...logContext, error: error?.message, details: error?.details });
             const isHttpsError = error instanceof HttpsError;
-            const code = isHttpsError ? error.code : 'UNKNOWN';
             let finalErrorCode: ErrorCode = ErrorCode.InternalError;
             let finalErrorMessageKey: string = "error.internalServer";
 
             if (isHttpsError) {
                 finalErrorCode = (error.details as any)?.errorCode as ErrorCode || ErrorCode.InternalError;
                 finalErrorMessageKey = error.message.startsWith("error.") ? error.message : `error.confirmAgreement.generic`;
-                if (!Object.values(ErrorCode).includes(finalErrorCode)) finalErrorCode = ErrorCode.InternalError;
+                 if (!Object.values(ErrorCode).includes(finalErrorCode)) finalErrorCode = ErrorCode.InternalError;
                  if (error.message.includes("::")) { finalErrorMessageKey = error.message; }
             }
+            // No transaction errors expected here unless DB fails
 
-            // Log admin action failure
-            logAdminAction("ConfirmEventAgreementFailed", { inputData: data, triggerUserId: customerId, errorMessage: error.message, finalErrorCode }).catch(...)
+            logUserActivity("ConfirmEventAgreementFailed", { bookingId, error: error.message }, customerId).catch(...)
 
             return { success: false, error: finalErrorMessageKey, errorCode: finalErrorCode };
         } finally {
