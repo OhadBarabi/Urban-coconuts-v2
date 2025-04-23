@@ -4,30 +4,23 @@ import * as admin from "firebase-admin";
 import { HttpsError } from "firebase-functions/v2/https";
 
 // --- Import Models ---
-import {
-    User, Order, OrderStatus, PaymentStatus, StatusHistoryEntry, PaymentDetails, PaymentMethod // Added User, PaymentMethod
-} from '../models'; // Adjust path if needed
+import { User, Order, OrderStatus, PaymentStatus, PaymentDetails } from '../models'; // Adjust path if needed
 
-// --- Assuming helper functions are imported or defined elsewhere ---
-// import { checkPermission } from '../utils/permissions';
-// import { processPaymentCapture, processPaymentVoid } from '../utils/payment_helpers'; // Payment processing
-// import { triggerCancellationSideEffects } from '../utils/background_triggers'; // Background task trigger
-// import { sendPushNotification } from '../utils/notifications';
-// import { logUserActivity, logAdminAction } from '../utils/logging';
+// --- Import Helpers ---
+import { checkPermission } from '../utils/permissions';
+import { processPaymentCapture } from '../utils/payment_helpers'; // For capturing payment on 'Black' status
+import { logUserActivity, logAdminAction } from '../utils/logging'; // Using mocks below
+import { sendPushNotification } from '../utils/notifications'; // Using mock below
 
-// --- Mocks for required helper functions (Replace with actual implementations) ---
-async function checkPermission(userId: string | null, permissionId: string, context?: any): Promise<boolean> { logger.info(`[Mock Auth] Check ${permissionId} for ${userId}`, context); return userId != null; }
-interface PaymentResult { success: boolean; transactionId?: string; error?: string; }
-async function processPaymentCapture(orderId: string, amount: number, currency: string, authTxId?: string | null): Promise<PaymentResult> { logger.info(`[Mock Payment] Capturing ${amount} ${currency} for order ${orderId} (Auth: ${authTxId})`); await new Promise(res => setTimeout(res, 1200)); if (Math.random() < 0.03) { logger.error("[Mock Payment] Capture FAILED."); return { success: false, error: "Mock Capture Failed" }; } return { success: true, transactionId: `CAP_${Date.now()}` }; }
-async function processPaymentVoid(orderId: string, authTxId: string): Promise<{ success: boolean; error?: string }> { logger.info(`[Mock Payment] Voiding Auth ${authTxId} for order ${orderId}`); await new Promise(res => setTimeout(res, 600)); if (authTxId.includes("fail_void")) { logger.error("[Mock Payment] Void FAILED."); return { success: false, error: "Mock Void Failed" }; } return { success: true }; }
-async function triggerCancellationSideEffects(params: { orderId: string }): Promise<void> { logger.info(`[Mock Trigger] Triggering cancellation side effects for order ${params.orderId}`); }
-async function sendPushNotification(params: any): Promise<void> { logger.info(`[Mock Notification] Sending notification`, params); }
-async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); }
-async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); }
+// --- Mocks ---
+// async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); } // Imported
+// async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); } // Imported
+// interface NotificationPayload { userId: string; type: string; titleKey: string; messageKey: string; messageParams?: { [key: string]: any }; payload?: { [key: string]: string }; } // Defined in notifications helper
+// async function sendPushNotification(notification: NotificationPayload): Promise<void> { logger.info(`[Mock Notification] Sending push notification to ${notification.userId}`, notification); } // Imported
 // --- End Mocks ---
 
+
 // --- Configuration ---
-// Ensure Firebase Admin is initialized (moved to index.ts)
 const db = admin.firestore();
 const { FieldValue, Timestamp } = admin.firestore;
 const FUNCTION_REGION = "me-west1"; // <<<--- CHANGE TO YOUR REGION
@@ -37,24 +30,26 @@ enum ErrorCode {
     Unauthenticated = "UNAUTHENTICATED", PermissionDenied = "PERMISSION_DENIED", InvalidArgument = "INVALID_ARGUMENT",
     NotFound = "NOT_FOUND", // Order or User not found
     FailedPrecondition = "FAILED_PRECONDITION", // Invalid status transition
-    Aborted = "ABORTED", // Payment capture/void failed
+    Aborted = "ABORTED", // Transaction or Payment Capture failed
     InternalError = "INTERNAL_ERROR",
     // Specific codes
     OrderNotFound = "ORDER_NOT_FOUND",
+    UserNotFound = "USER_NOT_FOUND",
+    InvalidOrderStatus = "INVALID_ORDER_STATUS", // Invalid target status value
     InvalidStatusTransition = "INVALID_STATUS_TRANSITION",
     PaymentCaptureFailed = "PAYMENT_CAPTURE_FAILED",
-    PaymentVoidFailed = "PAYMENT_VOID_FAILED",
-    SideEffectTriggerFailed = "SIDE_EFFECT_TRIGGER_FAILED",
+    MissingPaymentInfo = "MISSING_PAYMENT_INFO", // Missing authId for capture
+    TransactionFailed = "TRANSACTION_FAILED",
 }
 
 // --- Interfaces ---
 interface UpdateOrderStatusInput {
     orderId: string;
-    newStatus: OrderStatus | string; // Allow string for input validation
-    details?: {
-        reason?: string | null; // For cancellation or other context
-        paymentTxId?: string | null; // If payment confirmed externally (e.g., Cash)
-        // Add other context fields as needed
+    newStatus: OrderStatus; // Must be one of the valid OrderStatus enum values
+    details?: { // Optional details depending on the status update
+        reason?: string | null; // e.g., reason for delay or cancellation by admin
+        paymentTxId?: string | null; // If payment capture happens outside this function
+        courierId?: string | null; // ID of the courier performing the action (if applicable)
     } | null;
 }
 
@@ -62,20 +57,17 @@ interface UpdateOrderStatusInput {
 export const updateOrderStatus = functions.https.onCall(
     {
         region: FUNCTION_REGION,
-        memory: "512MiB", // Allow memory for potential payment interactions
-        timeoutSeconds: 60,
-        // secrets: ["PAYMENT_GATEWAY_SECRET"], // Add secrets if needed
+        memory: "1GiB", // Allow memory for potential payment capture
+        timeoutSeconds: 120, // Allow time for payment capture
+        // secrets: ["PAYMENT_GATEWAY_SECRET"], // If payment capture needs secret
     },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[updateOrderStatus V2]";
-        const startTime = Date.now();
+        const functionName = "[updateOrderStatus V1]"; // Keep original version name for now
+        const startTimeFunc = Date.now();
 
         // 1. Authentication & Authorization
-        if (!request.auth?.uid) {
-            logger.warn(`${functionName} Authentication failed: No UID.`);
-            return { success: false, error: "error.auth.unauthenticated", errorCode: ErrorCode.Unauthenticated };
-        }
-        const userId = request.auth.uid; // Could be Courier, Admin, or System
+        if (!request.auth?.uid) { return { success: false, error: "error.auth.unauthenticated", errorCode: ErrorCode.Unauthenticated }; }
+        const userId = request.auth.uid; // User performing the action (Courier or Admin)
         const data = request.data as UpdateOrderStatusInput;
         const logContext: any = { userId, orderId: data?.orderId, newStatus: data?.newStatus };
 
@@ -83,281 +75,237 @@ export const updateOrderStatus = functions.https.onCall(
 
         // 2. Input Validation
         if (!data?.orderId || typeof data.orderId !== 'string' ||
-            !data.newStatus || !Object.values(OrderStatus).includes(data.newStatus as OrderStatus) ||
-            (data.details != null && typeof data.details !== 'object'))
+            !data?.newStatus || !Object.values(OrderStatus).includes(data.newStatus) ||
+            (data.details != null && typeof data.details !== 'object') ||
+            (data.details?.reason != null && typeof data.details.reason !== 'string') ||
+            (data.details?.paymentTxId != null && typeof data.details.paymentTxId !== 'string') ||
+            (data.details?.courierId != null && typeof data.details.courierId !== 'string')
+           )
         {
             logger.error(`${functionName} Invalid input data structure or types.`, { ...logContext, data: JSON.stringify(data).substring(0,500) });
-            return { success: false, error: "error.invalidInput.structure", errorCode: ErrorCode.InvalidArgument };
+            let errorCode = ErrorCode.InvalidArgument;
+            if (data?.newStatus && !Object.values(OrderStatus).includes(data.newStatus)) {
+                errorCode = ErrorCode.InvalidOrderStatus;
+            }
+            return { success: false, error: "error.invalidInput.structureOrStatus", errorCode: errorCode };
         }
         const { orderId, newStatus, details } = data;
-        const reason = details?.reason ?? null;
 
         // --- Variables ---
         let orderData: Order;
-        let currentStatus: OrderStatus | string;
-        let userRole: string | null = null; // Determine role for logging/permissions
-        let paymentActionNeeded: 'capture' | 'void' | null = null;
-        let sideEffectTriggerNeeded = false;
-        let paymentResult: PaymentResult | { success: boolean; error?: string } | null = null;
-        let finalPaymentStatus: PaymentStatus | string | null = null;
+        let userData: User;
+        let userRole: string | null;
+        let captureResult: Awaited<ReturnType<typeof processPaymentCapture>> | null = null;
+        let updatedPaymentStatus: PaymentStatus | null = null;
+        let paymentDetailsUpdate: PaymentDetails | null = null;
+
+        // --- Firestore References ---
+        const orderRef = db.collection('orders').doc(orderId);
+        const userRef = db.collection('users').doc(userId); // User performing the action
 
         try {
-            // Fetch User Role (Optional but good for logging/context)
-            try {
-                const userSnap = await db.collection('users').doc(userId).get();
-                if (userSnap.exists) {
-                    userRole = (userSnap.data() as User)?.role ?? 'UnknownRole';
-                    logContext.userRole = userRole;
-                } else {
-                    logger.warn(`${functionName} User ID ${userId} not found in users collection. Assuming system/internal trigger.`, logContext);
-                    userRole = 'System';
-                }
-            } catch (userFetchError: any) {
-                logger.error(`${functionName} Failed to fetch user role for ${userId}. Proceeding without role context.`, { error: userFetchError.message });
-                userRole = 'ErrorFetchingRole';
-            }
+            // 3. Fetch User and Order Data Concurrently
+            const [userSnap, orderSnap] = await Promise.all([userRef.get(), orderRef.get()]);
 
-            // Permission Check (Example: Different permissions based on target status)
-            let requiredPermission = 'order:update_status:any'; // Default broad permission
-            if (newStatus === OrderStatus.Cancelled) requiredPermission = 'order:update_status:cancel';
-            if (newStatus === OrderStatus.Black) requiredPermission = 'order:update_status:complete';
-            if (newStatus === OrderStatus.Green) requiredPermission = 'order:update_status:ready'; // Example
-            if (newStatus === OrderStatus.Yellow) requiredPermission = 'order:update_status:prepare'; // Example
+            // Validate User
+            if (!userSnap.exists) throw new HttpsError('not-found', `User ${userId} not found.`, { errorCode: ErrorCode.UserNotFound });
+            userData = userSnap.data() as User;
+            userRole = userData.role;
+            logContext.userRole = userRole;
 
-            const hasPermission = await checkPermission(userId, requiredPermission, { orderId });
-            if (!hasPermission) {
-                logger.warn(`${functionName} Permission denied for user ${userId} (Role: ${userRole}) to set status ${newStatus}. Required: ${requiredPermission}`, logContext);
-                return { success: false, error: `error.permissionDenied.updateStatus::${newStatus}`, errorCode: ErrorCode.PermissionDenied };
-            }
-            logger.info(`${functionName} Permission '${requiredPermission}' granted.`);
-
-            // 3. Fetch Order & Validate Current Status
-            const orderRef = db.collection('orders').doc(orderId);
-            const orderSnap = await orderRef.get();
-
+            // Validate Order
             if (!orderSnap.exists) {
                 logger.warn(`${functionName} Order ${orderId} not found.`, logContext);
                 return { success: false, error: "error.order.notFound", errorCode: ErrorCode.OrderNotFound };
             }
             orderData = orderSnap.data() as Order;
-            currentStatus = orderData.status;
-            logContext.currentStatus = currentStatus;
-            logContext.currentPaymentStatus = orderData.paymentStatus;
+            logContext.currentStatus = orderData.status;
+            logContext.paymentStatus = orderData.paymentStatus;
+            logContext.customerId = orderData.customerId;
 
-            // Idempotency Check
-            if (currentStatus === newStatus) {
-                logger.info(`${functionName} Order ${orderId} is already in status '${newStatus}'. No update needed.`, logContext);
-                return { success: true };
+            // 4. Permission Check
+            // Define permission: 'order:updateStatus' (or more granular like 'order:updateStatus:courier', 'order:updateStatus:admin')
+            const hasPermission = await checkPermission(userId, userRole, 'order:updateStatus', logContext);
+            if (!hasPermission) {
+                logger.warn(`${functionName} Permission denied for user ${userId} (Role: ${userRole}) to update status for order ${orderId}.`, logContext);
+                return { success: false, error: "error.permissionDenied.updateStatus", errorCode: ErrorCode.PermissionDenied };
             }
 
-            // 4. Validate Status Transition Logic
+            // 5. State Transition Validation
+            // Define valid transitions based on current status and potentially user role
             const validTransitions: { [key in OrderStatus]?: OrderStatus[] } = {
-                [OrderStatus.Red]: [OrderStatus.Yellow, OrderStatus.Cancelled],
-                [OrderStatus.Yellow]: [OrderStatus.Green, OrderStatus.Cancelled],
-                [OrderStatus.Green]: [OrderStatus.Black, OrderStatus.Cancelled],
-                // Black and Cancelled are final states
+                [OrderStatus.Red]: [OrderStatus.Yellow, OrderStatus.Cancelled], // From Red, can go to Yellow (prep) or Cancelled
+                [OrderStatus.Yellow]: [OrderStatus.Green, OrderStatus.Cancelled], // From Yellow (prep), can go to Green (ready) or Cancelled
+                [OrderStatus.Green]: [OrderStatus.Black, OrderStatus.Cancelled], // From Green (ready), can go to Black (delivered) or Cancelled (e.g., customer no-show)
+                // Black (delivered) and Cancelled are final states for this function
             };
 
-            if (!validTransitions[currentStatus as OrderStatus]?.includes(newStatus as OrderStatus)) {
-                logger.warn(`${functionName} Invalid status transition: ${currentStatus} -> ${newStatus} for order ${orderId}.`, logContext);
-                return { success: false, error: `error.order.invalidTransition::${currentStatus}>>${newStatus}`, errorCode: ErrorCode.InvalidStatusTransition };
+            const allowedNextStatuses = validTransitions[orderData.status];
+            if (!allowedNextStatuses || !allowedNextStatuses.includes(newStatus)) {
+                 // Allow Admin to force cancel maybe? Add specific check if needed.
+                 if (newStatus === OrderStatus.Cancelled && (userRole === 'Admin' || userRole === 'SuperAdmin')) {
+                      logger.warn(`${functionName} Admin override: Allowing cancellation from status ${orderData.status}.`, logContext);
+                 } else {
+                    logger.warn(`${functionName} Invalid status transition from ${orderData.status} to ${newStatus} for order ${orderId}.`, logContext);
+                    return { success: false, error: `error.order.invalidStatusTransition::${orderData.status}->${newStatus}`, errorCode: ErrorCode.InvalidStatusTransition };
+                 }
             }
-            logger.info(`${functionName} Status transition ${currentStatus} -> ${newStatus} validated.`);
 
-            // 5. Determine Payment/Side Effect Actions based on transition
-            const authDetails = orderData.authDetails;
-            const authTxId = authDetails?.gatewayTransactionId ?? null;
-            const authAmount = authDetails?.authAmountSmallestUnit ?? 0;
-            const currency = orderData.currencyCode;
-            finalPaymentStatus = orderData.paymentStatus; // Start with current payment status
+            // 6. Handle Payment Capture on Completion (Moving to 'Black')
+            if (newStatus === OrderStatus.Black && orderData.paymentStatus === PaymentStatus.Authorized) {
+                const authId = orderData.authDetails?.authorizationId;
+                const amountToCapture = orderData.finalAmount; // Capture the final calculated amount
 
-            if (newStatus === OrderStatus.Black && currentStatus === OrderStatus.Green) {
-                // Order completed - Capture payment if it was authorized
-                if (orderData.paymentStatus === PaymentStatus.Authorized && authTxId && authAmount > 0 && currency) {
-                    paymentActionNeeded = 'capture';
-                } else if (orderData.paymentMethod === PaymentMethod.CashOnDelivery || orderData.paymentMethod === PaymentMethod.CreditOnDelivery) {
-                    // Assuming cash/credit was handled by courier, mark as PaidToCourier
-                    finalPaymentStatus = PaymentStatus.PaidToCourier; // Or just Paid?
-                } else if (orderData.paymentStatus !== PaymentStatus.Paid && orderData.paymentStatus !== PaymentStatus.PaidToCourier) {
-                    // If it wasn't Authorized or Cash/Credit, and not already Paid, mark as Paid (e.g., for UC Coins or 0 amount)
-                    finalPaymentStatus = PaymentStatus.Paid;
+                if (!authId) {
+                     logger.error(`${functionName} Cannot capture payment for order ${orderId}: Missing authorizationId.`, logContext);
+                     throw new HttpsError('internal', `error.internal.missingPaymentInfo::${orderId}`, { errorCode: ErrorCode.MissingPaymentInfo });
                 }
-            } else if (newStatus === OrderStatus.Cancelled) {
-                // Order cancelled - Void authorization or trigger refund side effects
-                if (orderData.paymentStatus === PaymentStatus.Authorized && authTxId) {
-                    paymentActionNeeded = 'void';
-                } else if (orderData.paymentStatus === PaymentStatus.Paid || orderData.paymentStatus === PaymentStatus.Captured) {
-                    // If already paid/captured, need to trigger refund process
-                    sideEffectTriggerNeeded = true;
-                    finalPaymentStatus = PaymentStatus.Pending; // Revert to pending until refund processed? Or 'RefundPending'?
-                } else {
-                    // If payment was Pending/Failed/Voided etc., just mark as Cancelled
-                    finalPaymentStatus = PaymentStatus.Cancelled;
+                 if (amountToCapture == null || amountToCapture <= 0) {
+                     logger.warn(`${functionName} Order ${orderId}: Final amount is ${amountToCapture}. Skipping payment capture. Marking as Paid.`, logContext);
+                     updatedPaymentStatus = PaymentStatus.Paid; // Mark as paid if amount is 0
+                 } else {
+                     logger.info(`${functionName} Order ${orderId} moving to 'Black'. Attempting to capture ${amountToCapture} ${orderData.currencyCode} for authorization ${authId}...`, logContext);
+                     captureResult = await processPaymentCapture(authId, amountToCapture, orderData.currencyCode);
+
+                     paymentDetailsUpdate = extractPaymentDetailsFromResult(captureResult); // Get details
+
+                     if (!captureResult.success) {
+                         updatedPaymentStatus = PaymentStatus.CaptureFailed;
+                         logger.error(`${functionName} Payment capture failed for order ${orderId}, AuthID: ${authId}.`, { ...logContext, error: captureResult.errorMessage, code: captureResult.errorCode });
+                         // Should we prevent moving to 'Black'? Or move to 'Black' but flag payment error?
+                         // Let's prevent moving to Black for now if capture fails.
+                         throw new HttpsError('aborted', `error.payment.captureFailed::${captureResult.errorCode || 'Unknown'}`, { errorCode: ErrorCode.PaymentCaptureFailed });
+                     } else {
+                         updatedPaymentStatus = PaymentStatus.Captured; // Or Paid? Let's use Captured.
+                         logger.info(`${functionName} Payment capture successful for order ${orderId}. TxID: ${captureResult.transactionId}`, logContext);
+                     }
+                 }
+            }
+
+            // 7. Firestore Transaction to Update Order Status
+            logger.info(`${functionName} Starting Firestore transaction to update order ${orderId} status to ${newStatus}...`, logContext);
+            await db.runTransaction(async (transaction) => {
+                const orderTxSnap = await transaction.get(orderRef);
+                if (!orderTxSnap.exists) throw new Error(`TX_ERR::${ErrorCode.OrderNotFound}`);
+                const orderTxData = orderTxSnap.data() as Order;
+
+                // Re-validate status transition within transaction
+                const currentTxStatus = orderTxData.status;
+                const allowedTxNextStatuses = validTransitions[currentTxStatus];
+                 if (!allowedTxNextStatuses || !allowedTxNextStatuses.includes(newStatus)) {
+                     if (newStatus === OrderStatus.Cancelled && (userRole === 'Admin' || userRole === 'SuperAdmin')) {
+                          logger.warn(`${functionName} TX Conflict Check: Admin override: Allowing cancellation from status ${currentTxStatus}.`, logContext);
+                     } else {
+                        logger.warn(`${functionName} TX Conflict: Order ${orderId} status changed to ${currentTxStatus} during TX. Aborting update to ${newStatus}.`, logContext);
+                        return; // Abort gracefully
+                     }
+                 }
+                 // Prevent re-processing if already at target status
+                 if (currentTxStatus === newStatus) {
+                      logger.warn(`${functionName} TX Conflict: Order ${orderId} already in status ${newStatus}. Aborting update.`, logContext);
+                      return;
+                 }
+
+                // Prepare Order Update
+                const now = Timestamp.now();
+                const updateData: { [key: string]: any } = {
+                    status: newStatus,
+                    updatedAt: FieldValue.serverTimestamp(),
+                    statusHistory: FieldValue.arrayUnion({
+                        status: newStatus,
+                        timestamp: now,
+                        userId: userId, // User performing the action
+                        role: userRole,
+                        reason: details?.reason ?? `Status updated to ${newStatus} by ${userRole ?? 'User'}`
+                    }),
+                    processingError: null, // Clear previous errors
+                };
+
+                // Add courier ID if provided and status is relevant (e.g., Green, Black)
+                if (details?.courierId && (newStatus === OrderStatus.Green || newStatus === OrderStatus.Black)) {
+                     updateData.courierId = details.courierId;
                 }
-            }
-            logContext.paymentAction = paymentActionNeeded;
-            logContext.sideEffectTrigger = sideEffectTriggerNeeded;
-            logContext.finalPaymentStatus = finalPaymentStatus;
-
-            // 6. Perform Payment Action (if needed)
-            if (paymentActionNeeded === 'capture') {
-                logger.info(`${functionName} Order ${orderId}: Attempting payment capture...`, logContext);
-                paymentResult = await processPaymentCapture(orderId, authAmount, currency, authTxId);
-                if (!paymentResult.success) {
-                    logger.error(`${functionName} Order ${orderId}: Payment capture FAILED.`, { ...logContext, error: paymentResult.error });
-                    // Throw error to prevent status change to Black
-                    throw new HttpsError('aborted', `error.payment.captureFailed::${paymentResult.error || 'Unknown'}`, { errorCode: ErrorCode.PaymentCaptureFailed });
+                // Add delivered timestamp if moving to Black
+                if (newStatus === OrderStatus.Black) {
+                    updateData.deliveredTimestamp = now;
                 }
-                logger.info(`${functionName} Order ${orderId}: Payment capture successful. TxID: ${(paymentResult as PaymentResult).transactionId}`, logContext);
-                finalPaymentStatus = PaymentStatus.Paid; // Or Captured
-            } else if (paymentActionNeeded === 'void') {
-                logger.info(`${functionName} Order ${orderId}: Attempting payment void...`, logContext);
-                paymentResult = await processPaymentVoid(orderId, authTxId!);
-                if (!paymentResult.success) {
-                    logger.error(`${functionName} Order ${orderId}: Payment void FAILED. Manual void required.`, { ...logContext, error: paymentResult.error });
-                    sendPushNotification({ subject: `Payment Void FAILED - Order ${orderId}`, body: `Failed to void auth ${authTxId} for cancelled order ${orderId}. Manual void REQUIRED.`, orderId, severity: "critical" }).catch(...);
-                    finalPaymentStatus = PaymentStatus.VoidFailed; // Allow cancellation, but mark payment state
-                } else {
-                    logger.info(`${functionName} Order ${orderId}: Payment void successful.`, logContext);
-                    finalPaymentStatus = PaymentStatus.Voided;
+                // Update payment status and details if capture was attempted
+                if (updatedPaymentStatus) {
+                    updateData.paymentStatus = updatedPaymentStatus;
                 }
-            }
-
-            // 7. Update Firestore Document
-            logger.info(`${functionName} Order ${orderId}: Updating Firestore document...`, logContext);
-            const now = Timestamp.now();
-            const serverTimestamp = FieldValue.serverTimestamp();
-            const updateData: { [key: string]: any } = {
-                status: newStatus,
-                updatedAt: serverTimestamp,
-                statusHistory: FieldValue.arrayUnion({
-                    from: currentStatus,
-                    to: newStatus,
-                    timestamp: now,
-                    userId: userId,
-                    role: userRole,
-                    reason: reason
-                })
-            };
-
-            // Update payment status if it changed
-            if (finalPaymentStatus && finalPaymentStatus !== orderData.paymentStatus) {
-                updateData.paymentStatus = finalPaymentStatus;
-                // Update paymentDetails with results from capture/void if needed
-                const currentPaymentDetails = orderData.paymentDetails ?? {};
-                if (paymentActionNeeded === 'capture' && paymentResult?.success) {
-                     updateData.paymentDetails = {
-                         ...currentPaymentDetails,
-                         chargeTimestamp: now,
-                         chargeTransactionId: (paymentResult as PaymentResult).transactionId,
-                         chargeAmountSmallestUnit: authAmount,
-                         chargeSuccess: true,
-                         chargeError: null,
-                     };
-                } else if (paymentActionNeeded === 'void' && paymentResult?.success) {
-                    updateData.paymentDetails = {
-                        ...currentPaymentDetails,
-                        voidTimestamp: now,
-                        voidSuccess: true,
-                        voidError: null,
-                    };
-                } else if (paymentActionNeeded === 'void' && !paymentResult?.success) {
-                     updateData.paymentDetails = {
-                        ...currentPaymentDetails,
-                        voidTimestamp: now,
-                        voidSuccess: false,
-                        voidError: paymentResult?.error ?? 'Unknown void error',
-                    };
+                if (paymentDetailsUpdate) {
+                    // Merge capture details with existing payment details (if any)
+                    updateData.paymentDetails = { ...(orderTxData.paymentDetails || {}), ...paymentDetailsUpdate };
                 }
-                 // Add logic to update details for capture failure if needed and status change allowed
-            }
+                 // Add capture failure details?
+                 if (captureResult && !captureResult.success) {
+                      updateData['paymentDetails.captureErrorCode'] = captureResult.errorCode;
+                      updateData['paymentDetails.captureErrorMessage'] = captureResult.errorMessage;
+                 }
 
-            // Add deliveredTimestamp if completing
-            if (newStatus === OrderStatus.Black) {
-                updateData.deliveredTimestamp = now;
-            }
 
-            await orderRef.update(updateData);
-            logger.info(`${functionName} Order ${orderId}: Firestore update successful.`);
+                // Perform Write
+                transaction.update(orderRef, updateData);
+            }); // End Transaction
+            logger.info(`${functionName} Transaction successful. Order ${orderId} status updated to ${newStatus}.`, logContext);
 
-            // 8. Trigger Async Side Effects (if needed)
-            if (sideEffectTriggerNeeded) {
-                logger.info(`${functionName} Order ${orderId}: Triggering cancellation side effects...`, logContext);
-                try {
-                    await triggerCancellationSideEffects({ orderId });
-                } catch (triggerError: any) {
-                    logger.error(`${functionName} Order ${orderId}: Failed to trigger cancellation side effects. Manual review needed.`, { ...logContext, error: triggerError.message });
-                    orderRef.update({ processingError: `Cancellation side effect trigger failed: ${triggerError.message}` }).catch(...);
-                    logAdminAction("CancellationSideEffectTriggerFailed", { orderId, reason: triggerError.message }).catch(...);
-                }
-            }
 
-            // 9. Trigger Notifications (Async)
-            const notificationPromises: Promise<void>[] = [];
-            let customerNotificationType: string | null = null;
-            let customerTitleKey: string | null = null;
-            let customerMessageKey: string | null = null;
-            const customerMessageParams: any = { orderIdShort: orderId.substring(0, 8) };
-
-            if (newStatus === OrderStatus.Green) {
-                customerNotificationType = "OrderReadyForPickup";
-                customerTitleKey = "notification.orderReady.title";
-                customerMessageKey = "notification.orderReady.message";
-            } else if (newStatus === OrderStatus.Black) {
-                customerNotificationType = "OrderCompleted";
-                customerTitleKey = "notification.orderCompleted.title";
-                customerMessageKey = "notification.orderCompleted.message";
-            } else if (newStatus === OrderStatus.Cancelled) {
-                customerNotificationType = "OrderCancelled";
-                customerTitleKey = "notification.orderCancelled.title";
-                customerMessageKey = "notification.orderCancelled.message";
-                customerMessageParams.reason = reason ?? "Order was cancelled.";
-            }
-
-            if (customerNotificationType && orderData.customerId) {
-                notificationPromises.push(sendPushNotification({
-                    userId: orderData.customerId, type: customerNotificationType,
-                    titleKey: customerTitleKey, messageKey: customerMessageKey,
-                    messageParams: customerMessageParams, payload: { orderId: orderId, screen: 'OrderDetails' }
-                }).catch(err => logger.error(`Failed sending customer notification for ${orderId}`, { err })));
-            }
-            // TODO: Notify Courier/Admin if needed based on status change?
-
-            // 10. Log Action (Async)
-            const logDetails = { orderId, oldStatus: currentStatus, newStatus, reason, paymentAction: paymentActionNeeded, paymentResultSuccess: paymentResult?.success ?? null, triggerUserId: userId, triggerUserRole: userRole };
+            // 8. Log Action (Async)
+            const logDetails = { orderId, customerId: orderData.customerId, oldStatus: orderData.status, newStatus, details, triggerUserId: userId, triggerUserRole: userRole, paymentUpdate: updatedPaymentStatus };
             if (userRole === 'Admin' || userRole === 'SuperAdmin') {
-                notificationPromises.push(logAdminAction("UpdateOrderStatus", logDetails).catch(err => logger.error("Failed logging admin action", { err })));
-            } else {
-                notificationPromises.push(logUserActivity("UpdateOrderStatus", logDetails, userId).catch(err => logger.error("Failed logging user activity", { err })));
+                logAdminAction("UpdateOrderStatus", logDetails)
+                    .catch(err => logger.error("Failed logging UpdateOrderStatus admin action", { err })); // Fixed catch
+            } else { // Assume Courier or other allowed role
+                logUserActivity("UpdateOrderStatus", logDetails, userId)
+                    .catch(err => logger.error("Failed logging UpdateOrderStatus user activity", { err })); // Fixed catch
             }
 
-            Promise.allSettled(notificationPromises); // Don't await
+            // 9. Send Notifications (Async) - e.g., notify customer their order is ready or delivered
+            if (newStatus === OrderStatus.Green) {
+                 sendPushNotification({
+                     userId: orderData.customerId, type: "OrderReady",
+                     titleKey: "notification.orderReady.title", messageKey: "notification.orderReady.message",
+                     messageParams: { orderId: orderId.substring(0, 6) }, payload: { orderId: orderId, screen: 'orderDetails' }
+                 }).catch(err => logger.error("Failed sending order ready notification", { err })); // Fixed catch
+            } else if (newStatus === OrderStatus.Black) {
+                 sendPushNotification({
+                     userId: orderData.customerId, type: "OrderDelivered",
+                     titleKey: "notification.orderDelivered.title", messageKey: "notification.orderDelivered.message",
+                     messageParams: { orderId: orderId.substring(0, 6) }, payload: { orderId: orderId, screen: 'orderDetails' }
+                 }).catch(err => logger.error("Failed sending order delivered notification", { err })); // Fixed catch
+            }
+            // Add notifications for other statuses if needed
 
-            // 11. Return Success
+            // 10. Return Success
             return { success: true };
 
         } catch (error: any) {
             // Error Handling
-            logger.error(`${functionName} Order ${orderId}: Execution failed.`, { ...logContext, error: error?.message, details: error?.details });
+            logger.error(`${functionName} Execution failed.`, { ...logContext, error: error?.message, details: error?.details });
             const isHttpsError = error instanceof HttpsError;
-            const code = isHttpsError ? error.code : 'UNKNOWN';
-            const details = isHttpsError ? error.details : null;
-            let errorMessage = error.message || "An unknown error occurred.";
             let finalErrorCode: ErrorCode = ErrorCode.InternalError;
             let finalErrorMessageKey: string = "error.internalServer";
 
             if (isHttpsError) {
-                finalErrorCode = (details as any)?.errorCode as ErrorCode || ErrorCode.InternalError;
-                finalErrorMessageKey = errorMessage.startsWith("error.") ? errorMessage : `error.updateOrderStatus.${finalErrorCode.toLowerCase()}`;
-                if (errorMessage.includes("::")) { finalErrorMessageKey = errorMessage; }
-                if (!Object.values(ErrorCode).includes(finalErrorCode)) finalErrorCode = ErrorCode.InternalError;
+                finalErrorCode = (error.details as any)?.errorCode as ErrorCode || ErrorCode.InternalError;
+                finalErrorMessageKey = error.message.startsWith("error.") ? error.message : `error.updateStatus.generic`;
+                 if (!Object.values(ErrorCode).includes(finalErrorCode)) finalErrorCode = ErrorCode.InternalError;
+                 if (error.message.includes("::")) { finalErrorMessageKey = error.message; }
+            } else if (error.message?.startsWith("TX_ERR::")) {
+                 const parts = error.message.split('::');
+                 const txErrCode = parts[1] as ErrorCode;
+                 finalErrorCode = Object.values(ErrorCode).includes(txErrCode) ? txErrCode : ErrorCode.TransactionFailed;
+                 finalErrorMessageKey = `error.transaction.${finalErrorCode.toLowerCase()}`;
+                 if (parts[2]) finalErrorMessageKey += `::${parts[2]}`;
             }
 
-            logAdminAction("UpdateOrderStatusFailed", { inputData: data, triggerUserId: userId, triggerUserRole: userRole, errorMessage, finalErrorCode }).catch(...);
+            // Log failure activity?
+            logUserActivity("UpdateOrderStatusFailed", { orderId, newStatus, error: error.message }, userId)
+                .catch(err => logger.error("Failed logging UpdateOrderStatusFailed user activity", { err })); // Fixed catch
 
             return { success: false, error: finalErrorMessageKey, errorCode: finalErrorCode };
         } finally {
-             logger.info(`${functionName} Execution finished for order ${orderId}. Duration: ${Date.now() - startTime}ms`, logContext);
+             logger.info(`${functionName} Execution finished. Duration: ${Date.now() - startTimeFunc}ms`, logContext);
         }
     }
 );
