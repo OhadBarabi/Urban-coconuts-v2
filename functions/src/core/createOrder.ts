@@ -10,13 +10,12 @@ import {
 } from '../models'; // Adjust path if needed
 
 // --- Import Helpers ---
-// import { checkPermission } from '../utils/permissions'; // Still using mock below
+import { checkPermission } from '../utils/permissions'; // <-- Import REAL helper
 // import { calculateOrderTotal } from '../utils/order_calculations'; // Still using mock below
 // import { logUserActivity } from '../utils/logging'; // Still using mock below
-import { initiateAuthorization, extractPaymentDetailsFromResult } from '../utils/payment_helpers'; // <-- Import from new helper
+import { initiateAuthorization, extractPaymentDetailsFromResult } from '../utils/payment_helpers';
 
-// --- Mocks for required helper functions (Replace with actual implementations) ---
-async function checkPermission(userId: string | null, userRole: string | null, permissionId: string, context?: any): Promise<boolean> { logger.info(`[Mock Auth] Check ${permissionId} for ${userId} (${userRole})`, context); return userId != null; }
+// --- Mocks for other required helper functions (Replace with actual implementations) ---
 interface CalculationResult { totalAmount: number; itemsTotal: number; couponDiscount: number; ucCoinDiscount: number; finalAmount: number; error?: string; }
 function calculateOrderTotal(items: Array<{ productId: string; quantity: number; unitPrice: number }>, coupon?: any | null, ucCoinsToUse?: number | null, userCoinBalance?: number, tipAmount?: number): CalculationResult { logger.info(`[Mock Calc] Calculating total...`); const itemsTotal = items.reduce((sum, item) => sum + (item.unitPrice * item.quantity), 0); const couponDiscount = coupon ? 500 : 0; const ucCoinDiscount = Math.min(ucCoinsToUse ?? 0, userCoinBalance ?? 0); const finalAmount = itemsTotal - couponDiscount - ucCoinDiscount + (tipAmount ?? 0); return { totalAmount: itemsTotal, itemsTotal, couponDiscount, ucCoinDiscount, finalAmount }; }
 async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); }
@@ -76,7 +75,7 @@ export const createOrder = functions.https.onCall(
         // secrets: ["PAYMENT_GATEWAY_SECRET"], // Uncomment if payment helper needs secrets
     },
     async (request): Promise<{ success: true; orderId: string; requiresAction?: boolean; actionUrl?: string } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[createOrder V2 - Refactored]";
+        const functionName = "[createOrder V3 - Permissions]";
         const startTimeFunc = Date.now();
 
         // 1. Authentication & Authorization
@@ -103,12 +102,12 @@ export const createOrder = functions.https.onCall(
 
         // --- Variables ---
         let userData: User;
-        let userRole: string | null;
+        let userRole: string | null; // We'll fetch this now
         let boxData: Box;
         let fetchedProducts = new Map<string, Product>(); // Map product IDs to product data
         let orderItems: OrderItem[] = [];
         let calculationResult: CalculationResult;
-        let authorizationResult: Awaited<ReturnType<typeof initiateAuthorization>> | null = null; // Use the type from the helper
+        let authorizationResult: Awaited<ReturnType<typeof initiateAuthorization>> | null = null;
         let paymentStatus: PaymentStatus;
         let authDetails: PaymentDetails | null = null;
         const orderId = db.collection('orders').doc().id; // Pre-generate order ID
@@ -130,7 +129,7 @@ export const createOrder = functions.https.onCall(
             // Validate User
             if (!userSnap.exists) throw new HttpsError('not-found', `error.user.notFound::${customerId}`, { errorCode: ErrorCode.UserNotFound });
             userData = userSnap.data() as User;
-            userRole = userData.role; // For permission check if needed
+            userRole = userData.role; // Get the role from user data
             logContext.userRole = userRole;
             if (!userData.isActive) throw new HttpsError('permission-denied', "error.user.inactive", { errorCode: ErrorCode.PermissionDenied });
 
@@ -139,7 +138,6 @@ export const createOrder = functions.https.onCall(
             boxData = boxSnap.data() as Box;
             logContext.currencyCode = boxData.currencyCode;
             if (!boxData.isActive) throw new HttpsError('failed-precondition', `error.box.inactive::${boxId}`, { errorCode: ErrorCode.BoxInactive });
-            // TODO: Add check for box visibility? `boxData.isCustomerVisible`?
 
             // Validate Products and build OrderItems list
             productDocs.forEach((doc, index) => {
@@ -150,33 +148,32 @@ export const createOrder = functions.https.onCall(
                 fetchedProducts.set(productId, product);
 
                 const cartItem = cartItems.find(item => item.productId === productId);
-                if (!cartItem) throw new HttpsError('internal', `Logic error: Cart item not found for product ${productId}`); // Should not happen
+                if (!cartItem) throw new HttpsError('internal', `Logic error: Cart item not found for product ${productId}`);
 
                 orderItems.push({
-                    orderItemId: uuidv4(), // Generate unique ID for each line item
+                    orderItemId: uuidv4(),
                     productId: productId,
-                    productName: product.productName_i18n?.[userData.preferredLanguage || 'en'] ?? product.productName_i18n?.['en'] ?? 'Unknown Product', // Snapshot name in user's lang or fallback
+                    productName: product.productName_i18n?.[userData.preferredLanguage || 'en'] ?? product.productName_i18n?.['en'] ?? 'Unknown Product',
                     quantity: cartItem.quantity,
-                    unitPrice: product.priceSmallestUnit, // Snapshot price
-                    // itemStatus: 'Pending', // Add if needed later
+                    unitPrice: product.priceSmallestUnit,
                 });
             });
 
-            // 4. Permission Check (Basic: Is user allowed to order?)
-            const hasPermission = await checkPermission(customerId, userRole, 'order:create');
+            // 4. Permission Check (Using REAL helper)
+            // Pass the fetched role to avoid redundant DB read inside checkPermission
+            const hasPermission = await checkPermission(customerId, userRole, 'order:create', logContext);
             if (!hasPermission) {
-                logger.warn(`${functionName} Permission denied for user ${customerId} to create order.`, logContext);
+                logger.warn(`${functionName} Permission denied for user ${customerId} (Role: ${userRole}) to create order.`, logContext);
                 return { success: false, error: "error.permissionDenied.createOrder", errorCode: ErrorCode.PermissionDenied };
             }
 
             // 5. Calculate Order Totals
-            // TODO: Fetch actual coupon data if couponCode is provided
             logger.info(`${functionName} Calculating order totals...`, logContext);
             calculationResult = calculateOrderTotal(
                 orderItems,
-                couponCode ? { couponCode } : null, // Pass minimal coupon info
+                couponCode ? { couponCode } : null,
                 ucCoinsToUse,
-                userData.ucCoinBalance // Pass current balance for validation
+                userData.ucCoinBalance
             );
             if (calculationResult.error) {
                 throw new HttpsError('internal', `error.internal.calculation::${calculationResult.error}`, { errorCode: ErrorCode.CalculationError });
@@ -184,146 +181,119 @@ export const createOrder = functions.https.onCall(
             const { totalAmount, finalAmount, couponDiscount, ucCoinDiscount } = calculationResult;
             logContext.totalAmount = totalAmount;
             logContext.finalAmount = finalAmount;
-
-            // Check if final amount is positive (it might be zero if fully paid by UC coins)
             if (finalAmount < 0) {
                  throw new HttpsError('internal', "Calculation resulted in negative final amount.");
             }
 
             // 6. Handle Payment Authorization (if applicable)
-            paymentStatus = PaymentStatus.Pending; // Default for Cash/Credit on Delivery or UC Coins Only
+            paymentStatus = PaymentStatus.Pending;
             if (paymentMethod === PaymentMethod.CreditCardApp || paymentMethod === PaymentMethod.BitApp) {
                 if (finalAmount > 0) {
                     logger.info(`${functionName} Initiating payment authorization for ${finalAmount} ${boxData.currencyCode}...`, logContext);
-                    paymentStatus = PaymentStatus.AuthorizationPending; // Update status before calling
+                    paymentStatus = PaymentStatus.AuthorizationPending;
                     authorizationResult = await initiateAuthorization(
-                        customerId,
-                        finalAmount,
-                        boxData.currencyCode,
-                        `Order ${orderId} - Urban Coconuts`,
-                        paymentMethodToken,
-                        userData.paymentGatewayCustomerId,
-                        orderId
+                        customerId, finalAmount, boxData.currencyCode, `Order ${orderId} - Urban Coconuts`,
+                        paymentMethodToken, userData.paymentGatewayCustomerId, orderId
                     );
-
-                    authDetails = extractPaymentDetailsFromResult(authorizationResult); // Extract details even on failure
+                    authDetails = extractPaymentDetailsFromResult(authorizationResult);
 
                     if (!authorizationResult.success) {
                         paymentStatus = PaymentStatus.AuthorizationFailed;
                         logger.error(`${functionName} Payment authorization failed.`, { ...logContext, error: authorizationResult.errorMessage, code: authorizationResult.errorCode });
-                        // Return specific error based on payment failure
                         if (authorizationResult.requiresAction) {
                              return { success: false, error: "error.payment.actionRequired", errorCode: ErrorCode.PaymentActionRequired, requiresAction: true, actionUrl: authorizationResult.actionUrl };
                         } else {
                              return { success: false, error: `error.payment.authFailed::${authorizationResult.errorCode || 'Unknown'}`, errorCode: ErrorCode.PaymentAuthFailed };
                         }
                     }
-                    // If successful authorization
                     paymentStatus = PaymentStatus.Authorized;
                     logger.info(`${functionName} Payment authorization successful. AuthID: ${authorizationResult.authorizationId}`, logContext);
                      if (authorizationResult.requiresAction) {
                          paymentStatus = PaymentStatus.AuthorizationActionRequired;
-                         // We still create the order but return action required info
                          logger.warn(`${functionName} Payment authorization requires further action (e.g., 3DS).`, logContext);
                      }
-
                 } else {
-                    // Final amount is 0 (e.g., fully paid by UC coins), no authorization needed.
-                    paymentStatus = PaymentStatus.Paid; // Mark as Paid directly
+                    paymentStatus = PaymentStatus.Paid;
                     logger.info(`${functionName} Final amount is 0, skipping payment authorization.`, logContext);
                 }
             } else if (paymentMethod === PaymentMethod.UC_Coins_Only) {
                  if (finalAmount > 0) {
-                     // This shouldn't happen if calculation logic is correct and ucCoinsToUse was validated
                      throw new HttpsError('failed-precondition', "UC_Coins_Only selected but final amount is greater than 0.");
                  }
-                 paymentStatus = PaymentStatus.Paid; // Paid by UC Coins
+                 paymentStatus = PaymentStatus.Paid;
             }
             logContext.paymentStatus = paymentStatus;
-
 
             // 7. Firestore Transaction to Create Order and Update Inventory/User Balance
             logger.info(`${functionName} Starting Firestore transaction...`, logContext);
             await db.runTransaction(async (transaction) => {
-                // Re-read box and user data within transaction for consistency
                 const boxTxSnap = await transaction.get(boxRef);
                 const userTxSnap = await transaction.get(userRef);
-
                 if (!boxTxSnap.exists) throw new Error(`TX_ERR::${ErrorCode.BoxNotFound}`);
                 if (!userTxSnap.exists) throw new Error(`TX_ERR::${ErrorCode.UserNotFound}`);
                 const boxTxData = boxTxSnap.data() as Box;
                 const userTxData = userTxSnap.data() as User;
 
-                // --- Inventory Check and Update ---
                 const inventoryUpdates: { [key: string]: admin.firestore.FieldValue } = {};
                 const currentInventory = boxTxData.inventory ?? {};
                 for (const item of orderItems) {
                     const currentStock = currentInventory[item.productId] ?? 0;
                     if (currentStock < item.quantity) {
-                        logger.error(`${functionName} TX Check: Insufficient inventory for product ${item.productId}. Available: ${currentStock}, Requested: ${item.quantity}.`, logContext);
                         throw new Error(`TX_ERR::${ErrorCode.InventoryUnavailable}::${item.productId}`);
                     }
                     inventoryUpdates[`inventory.${item.productId}`] = FieldValue.increment(-item.quantity);
                 }
 
-                // --- User Balance Update (if UC Coins used) ---
                 let userUpdateData: { [key: string]: any } = {};
                 if (ucCoinDiscount > 0) {
                     const currentBalance = userTxData.ucCoinBalance ?? 0;
                     if (currentBalance < ucCoinDiscount) {
-                         logger.error(`${functionName} TX Check: Insufficient UC Coin balance for user ${customerId}. Available: ${currentBalance}, Requested: ${ucCoinDiscount}.`, logContext);
                         throw new Error(`TX_ERR::${ErrorCode.ResourceExhausted}::UC Coins`);
                     }
                     userUpdateData.ucCoinBalance = FieldValue.increment(-ucCoinDiscount);
                 }
 
-                // --- Create Order Document ---
                 const now = Timestamp.now();
-                const initialStatus = OrderStatus.Red; // Default starting status
+                const initialStatus = OrderStatus.Red;
                 const newOrderData: Order = {
-                    orderId: orderId, // Store generated ID in the document
-                    orderNumber: `UC-${orderId.substring(0, 6).toUpperCase()}`, // Example readable number
+                    orderId: orderId,
+                    orderNumber: `UC-${orderId.substring(0, 6).toUpperCase()}`,
                     customerId: customerId,
-                    courierId: null, // Assigned later
+                    courierId: null,
                     boxId: boxId,
                     items: orderItems,
                     status: initialStatus,
                     statusHistory: [{ status: initialStatus, timestamp: now, userId: customerId, role: userRole ?? 'Customer', reason: "Order created" }],
                     paymentMethod: paymentMethod,
-                    paymentStatus: paymentStatus, // Set based on auth result or payment method
+                    paymentStatus: paymentStatus,
                     currencyCode: boxData.currencyCode,
-                    authDetails: authDetails, // Store details from authorization attempt
-                    paymentDetails: null, // Capture/final payment details added later
-                    totalAmount: totalAmount, // Before discounts/coins
+                    authDetails: authDetails,
+                    paymentDetails: null,
+                    totalAmount: totalAmount,
                     ucCoinsUsed: ucCoinDiscount > 0 ? ucCoinDiscount : null,
                     couponCodeUsed: couponCode || null,
                     couponDiscountValue: couponDiscount,
-                    tipAmountSmallestUnit: null, // Added later
-                    finalAmount: finalAmount, // After discounts/coins, before tip
+                    tipAmountSmallestUnit: null,
+                    finalAmount: finalAmount,
                     orderTimestamp: now,
                     deliveredTimestamp: null,
-                    pickupTimeWindow: null, // Calculated/set later?
+                    pickupTimeWindow: null,
                     notes: notes || null,
                     issueReported: false,
                     issueDetails: null,
-                    orderQrCodeData: `UCO:${orderId}`, // Simple QR data example
+                    orderQrCodeData: `UCO:${orderId}`,
                     cancellationSideEffectsProcessed: false,
                     createdAt: now,
                     updatedAt: now,
                 };
                 const orderRef = db.collection('orders').doc(orderId);
                 transaction.set(orderRef, newOrderData);
-
-                // --- Perform Writes ---
-                // 1. Update Box Inventory
                 transaction.update(boxRef, inventoryUpdates);
-                // 2. Update User Balance (if needed)
                 if (Object.keys(userUpdateData).length > 0) {
                     transaction.update(userRef, userUpdateData);
                 }
-            }); // End Transaction
+            });
             logger.info(`${functionName} Transaction successful. Order ${orderId} created.`, logContext);
-
 
             // 8. Log User Activity (Async)
             logUserActivity("CreateOrder", { orderId, boxId, itemCount: orderItems.length, finalAmount, paymentMethod, paymentStatus }, customerId)
@@ -360,7 +330,6 @@ export const createOrder = functions.https.onCall(
                  if (parts[2]) finalErrorMessageKey += `::${parts[2]}`;
             }
 
-            // Log failure activity?
             logUserActivity("CreateOrderFailed", { boxId, itemCount: cartItems.length, paymentMethod, error: error.message }, customerId).catch(...)
 
             return { success: false, error: finalErrorMessageKey, errorCode: finalErrorCode };
