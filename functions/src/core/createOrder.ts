@@ -270,7 +270,7 @@ export const createOrder = functions.https.onCall(
 
             // 8. Log User Activity (Async)
             logUserActivity("CreateOrder", { orderId, boxId, itemCount: orderItems.length, finalAmount, paymentMethod, paymentStatus }, customerId)
-                .catch(err => logger.error("Failed logging CreateOrder user activity", { err })); // Fixed catch
+                .catch(err => logger.error("Failed logging CreateOrder user activity", { err }));
 
             // 9. Return Success
             const successResponse: { success: true; orderId: string; requiresAction?: boolean; actionUrl?: string } = {
@@ -303,7 +303,7 @@ export const createOrder = functions.https.onCall(
             }
 
             logUserActivity("CreateOrderFailed", { boxId, itemCount: cartItems.length, paymentMethod, error: error.message }, customerId)
-                .catch(err => logger.error("Failed logging CreateOrderFailed user activity", { err })); // Fixed catch
+                .catch(err => logger.error("Failed logging CreateOrderFailed user activity", { err }));
 
             return { success: false, error: finalErrorMessageKey, errorCode: finalErrorCode };
         } finally {
