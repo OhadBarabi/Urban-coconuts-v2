@@ -10,15 +10,14 @@ import {
 } from '../models'; // Adjust path if needed
 
 // --- Import Helpers ---
-import { checkPermission } from '../utils/permissions'; // <-- Import REAL helper
-// import { calculateOrderTotal } from '../utils/order_calculations'; // Still using mock below
-// import { logUserActivity, logAdminAction } from '../utils/logging'; // Still using mocks below
+import { checkPermission } from '../utils/permissions';
+import { logUserActivity, logAdminAction } from '../utils/logging'; // Using mocks below
 
 // --- Mocks for other required helper functions (Replace with actual implementations) ---
 interface CalculationResult { totalAmount: number; itemsTotal: number; couponDiscount: number; ucCoinDiscount: number; finalAmount: number; error?: string; }
 function calculateOrderTotal(items: Array<{ productId: string; quantity: number; unitPrice: number }>, coupon?: any | null, ucCoinsToUse?: number | null, userCoinBalance?: number, tipAmount?: number): CalculationResult { logger.info(`[Mock Calc] Recalculating total for edit...`); const itemsTotal = items.reduce((sum, item) => sum + (item.unitPrice * item.quantity), 0); const couponDiscount = coupon ? 500 : 0; const ucCoinDiscount = Math.min(ucCoinsToUse ?? 0, userCoinBalance ?? 0); const finalAmount = itemsTotal - couponDiscount - ucCoinDiscount + (tipAmount ?? 0); return { totalAmount: itemsTotal, itemsTotal, couponDiscount, ucCoinDiscount, finalAmount }; }
-async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); }
-async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); }
+// async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); } // Imported
+// async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); } // Imported
 // --- End Mocks ---
 
 // --- Configuration ---
@@ -67,12 +66,12 @@ export const editOrder = functions.https.onCall(
         timeoutSeconds: 60,
     },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[editOrder V2 - Permissions]"; // Updated version name
+        const functionName = "[editOrder V2 - Permissions]";
         const startTimeFunc = Date.now();
 
         // 1. Authentication & Authorization
         if (!request.auth?.uid) { return { success: false, error: "error.auth.unauthenticated", errorCode: ErrorCode.Unauthenticated }; }
-        const userId = request.auth.uid; // User initiating edit (Customer or Admin)
+        const userId = request.auth.uid;
         const data = request.data as EditOrderInput;
         const logContext: any = { userId, orderId: data?.orderId, updatedItemCount: data?.updatedItems?.length };
 
@@ -80,7 +79,7 @@ export const editOrder = functions.https.onCall(
 
         // 2. Input Validation
         if (!data?.orderId || typeof data.orderId !== 'string' ||
-            !Array.isArray(data.updatedItems) || data.updatedItems.length === 0 || // Must provide at least one item
+            !Array.isArray(data.updatedItems) || data.updatedItems.length === 0 ||
             data.updatedItems.some(item => !item.productId || typeof item.quantity !== 'number' || !Number.isInteger(item.quantity) || item.quantity <= 0) ||
             (data.updatedNotes !== undefined && typeof data.updatedNotes !== 'string' && data.updatedNotes !== null))
         {
@@ -91,10 +90,10 @@ export const editOrder = functions.https.onCall(
 
         // --- Variables ---
         let orderData: Order;
-        let userData: User; // Needed for recalculation if UC Coins/Coupons involved
-        let userRole: string | null; // Fetch user role
-        let boxData: Box; // Needed for inventory check
-        let fetchedProducts = new Map<string, Product>(); // Map product IDs to product data
+        let userData: User;
+        let userRole: string | null;
+        let boxData: Box;
+        let fetchedProducts = new Map<string, Product>();
         let newOrderItems: OrderItem[] = [];
         let calculationResult: CalculationResult;
 
@@ -105,13 +104,11 @@ export const editOrder = functions.https.onCall(
 
             const [userSnap, orderSnap] = await Promise.all([userRef.get(), orderRef.get()]);
 
-            // Validate User
             if (!userSnap.exists) throw new HttpsError('not-found', `error.user.notFound::${userId}`, { errorCode: ErrorCode.UserNotFound });
             userData = userSnap.data() as User;
-            userRole = userData.role; // Get role
+            userRole = userData.role;
             logContext.userRole = userRole;
 
-            // Validate Order
             if (!orderSnap.exists) {
                 logger.warn(`${functionName} Order ${orderId} not found.`, logContext);
                 return { success: false, error: "error.order.notFound", errorCode: ErrorCode.OrderNotFound };
@@ -121,19 +118,16 @@ export const editOrder = functions.https.onCall(
             logContext.orderCustomerId = orderData.customerId;
             logContext.boxId = orderData.boxId;
 
-            // Fetch Box Data (needed for inventory)
             if (!orderData.boxId) throw new HttpsError('internal', `Order ${orderId} is missing boxId.`);
             const boxRef = db.collection('boxes').doc(orderData.boxId);
             const boxSnap = await boxRef.get();
             if (!boxSnap.exists) throw new HttpsError('not-found', `error.box.notFound::${orderData.boxId}`, { errorCode: ErrorCode.BoxNotFound });
             boxData = boxSnap.data() as Box;
 
-            // 4. Permission Check (Using REAL helper)
+            // 4. Permission Check
             const isOwner = userId === orderData.customerId;
             const isAdmin = userRole === 'Admin' || userRole === 'SuperAdmin';
-            // Define permissions needed: e.g., 'order:edit:own', 'order:edit:any'
             const requiredPermission = isOwner ? 'order:edit:own' : (isAdmin ? 'order:edit:any' : 'permission_denied');
-            // Pass fetched role to checkPermission
             const hasPermission = await checkPermission(userId, userRole, requiredPermission, logContext);
             if (!hasPermission) {
                 logger.warn(`${functionName} Permission denied for user ${userId} (Role: ${userRole}) to edit order ${orderId}.`, logContext);
@@ -141,7 +135,7 @@ export const editOrder = functions.https.onCall(
                 return { success: false, error: "error.permissionDenied.editOrder", errorCode: errorCode };
             }
 
-            // 5. State Validation - Logic remains the same as V1
+            // 5. State Validation
             const editableStatuses: string[] = [OrderStatus.Red.toString()];
             if (!editableStatuses.includes(orderData.status)) {
                 logger.warn(`${functionName} Order ${orderId} cannot be edited from status '${orderData.status}'.`, logContext);
@@ -153,7 +147,7 @@ export const editOrder = functions.https.onCall(
                  return { success: false, error: `error.order.invalidPaymentStatus.edit::${orderData.paymentStatus}`, errorCode: ErrorCode.InvalidOrderStatus };
             }
 
-            // 6. Fetch Product Data for all involved items - Logic remains the same as V1
+            // 6. Fetch Product Data
             const originalProductIds = orderData.items.map(item => item.productId);
             const updatedProductIds = updatedItems.map(item => item.productId);
             const allProductIds = [...new Set([...originalProductIds, ...updatedProductIds])];
@@ -174,10 +168,10 @@ export const editOrder = functions.https.onCall(
                 }
             });
 
-            // Build the new list of OrderItems with snapshots - Logic remains the same as V1
+            // Build new OrderItems list
             newOrderItems = updatedItems.map(newItem => {
                 const product = fetchedProducts.get(newItem.productId);
-                if (!product) throw new HttpsError('internal', `Internal error: Product ${newItem.productId} not found in fetched map during item creation.`);
+                if (!product) throw new HttpsError('internal', `Internal error: Product ${newItem.productId} not found in fetched map.`);
                 return {
                     orderItemId: uuidv4(),
                     productId: newItem.productId,
@@ -187,14 +181,11 @@ export const editOrder = functions.https.onCall(
                 };
             });
 
-            // 7. Recalculate Order Totals - Logic remains the same as V1
+            // 7. Recalculate Totals
             logger.info(`${functionName} Recalculating order totals...`, logContext);
             calculationResult = calculateOrderTotal(
-                newOrderItems,
-                orderData.couponCodeUsed ? { couponCode: orderData.couponCodeUsed } : null,
-                orderData.ucCoinsUsed,
-                userData.ucCoinBalance,
-                orderData.tipAmountSmallestUnit
+                newOrderItems, orderData.couponCodeUsed ? { couponCode: orderData.couponCodeUsed } : null,
+                orderData.ucCoinsUsed, userData.ucCoinBalance, orderData.tipAmountSmallestUnit
             );
             if (calculationResult.error) {
                 throw new HttpsError('internal', `error.internal.calculation::${calculationResult.error}`, { errorCode: ErrorCode.CalculationError });
@@ -203,7 +194,7 @@ export const editOrder = functions.https.onCall(
             logContext.newTotalAmount = newItemsTotal;
             logContext.newFinalAmount = newFinalAmount;
 
-            // 8. Firestore Transaction - Logic remains the same as V1
+            // 8. Firestore Transaction
             logger.info(`${functionName} Starting Firestore transaction for order edit...`, logContext);
             await db.runTransaction(async (transaction) => {
                 const orderTxSnap = await transaction.get(orderRef);
@@ -215,11 +206,11 @@ export const editOrder = functions.https.onCall(
                 const boxTxData = boxTxSnap.data() as Box;
 
                 if (!editableStatuses.includes(orderTxData.status)) {
-                     logger.warn(`${functionName} TX Conflict: Order ${orderId} status changed to ${orderTxData.status} during TX. Aborting edit.`, logContext);
+                     logger.warn(`${functionName} TX Conflict: Order ${orderId} status changed. Aborting edit.`, logContext);
                      return;
                 }
                  if (nonEditablePaymentStatuses.includes(orderTxData.paymentStatus)) {
-                     logger.warn(`${functionName} TX Conflict: Order ${orderId} payment status changed to ${orderTxData.paymentStatus} during TX. Aborting edit.`, logContext);
+                     logger.warn(`${functionName} TX Conflict: Order ${orderId} payment status changed. Aborting edit.`, logContext);
                      return;
                  }
 
@@ -233,7 +224,6 @@ export const editOrder = functions.https.onCall(
                     const originalQty = originalItemMap.get(productId) ?? 0;
                     const newQty = newItemMap.get(productId) ?? 0;
                     const change = newQty - originalQty;
-
                     if (change !== 0) {
                         const currentStock = currentInventory[productId] ?? 0;
                         const stockAfterChange = currentStock - change;
@@ -247,18 +237,11 @@ export const editOrder = functions.https.onCall(
                 // Prepare Order Update
                 const now = Timestamp.now();
                 const updateData: { [key: string]: any } = {
-                    items: newOrderItems,
-                    totalAmount: newItemsTotal,
-                    finalAmount: newFinalAmount,
+                    items: newOrderItems, totalAmount: newItemsTotal, finalAmount: newFinalAmount,
                     notes: updatedNotes === undefined ? orderTxData.notes : (updatedNotes ?? null),
                     updatedAt: FieldValue.serverTimestamp(),
-                    statusHistory: FieldValue.arrayUnion({
-                        timestamp: now,
-                        userId: userId,
-                        role: userRole,
-                        reason: `Order edited by ${userRole ?? 'User'}`
-                    }),
-                     processingError: null,
+                    statusHistory: FieldValue.arrayUnion({ timestamp: now, userId: userId, role: userRole, reason: `Order edited by ${userRole ?? 'User'}` }),
+                    processingError: null,
                 };
 
                 // Perform Writes
@@ -269,19 +252,21 @@ export const editOrder = functions.https.onCall(
             });
             logger.info(`${functionName} Order ${orderId} edited successfully.`, logContext);
 
-            // 9. Log Action (Async) - Logic remains the same as V1
+            // 9. Log Action (Async)
             const logDetails = { orderId, customerId: orderData.customerId, oldItemCount: orderData.items.length, newItemCount: newOrderItems.length, oldFinalAmount: orderData.finalAmount, newFinalAmount, notesChanged: updatedNotes !== undefined, triggerUserId: userId, triggerUserRole: userRole };
             if (isAdmin) {
-                logAdminAction("EditOrder", logDetails).catch(err => logger.error("Failed logging admin action", { err }));
+                logAdminAction("EditOrder", logDetails)
+                    .catch(err => logger.error("Failed logging EditOrder admin action", { err })); // Fixed catch
             } else {
-                logUserActivity("EditOrder", logDetails, userId).catch(err => logger.error("Failed logging user activity", { err }));
+                logUserActivity("EditOrder", logDetails, userId)
+                    .catch(err => logger.error("Failed logging EditOrder user activity", { err })); // Fixed catch
             }
 
-            // 10. Return Success - Logic remains the same as V1
+            // 10. Return Success
             return { success: true };
 
         } catch (error: any) {
-            // Error Handling - Logic remains the same as V1
+            // Error Handling
             logger.error(`${functionName} Execution failed.`, { ...logContext, error: error?.message, details: error?.details });
             const isHttpsError = error instanceof HttpsError;
             let finalErrorCode: ErrorCode = ErrorCode.InternalError;
@@ -300,7 +285,8 @@ export const editOrder = functions.https.onCall(
                  if (parts[2]) finalErrorMessageKey += `::${parts[2]}`;
             }
 
-            logUserActivity("EditOrderFailed", { orderId, error: error.message }, userId).catch(...)
+            logUserActivity("EditOrderFailed", { orderId, error: error.message }, userId)
+                .catch(err => logger.error("Failed logging EditOrderFailed user activity", { err })); // Fixed catch
 
             return { success: false, error: finalErrorMessageKey, errorCode: finalErrorCode };
         } finally {
