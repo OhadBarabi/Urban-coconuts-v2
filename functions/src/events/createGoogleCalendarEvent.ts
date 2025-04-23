@@ -1,253 +1,219 @@
 import * as functions from "firebase-functions/v2";
 import * as logger from "firebase-functions/logger";
 import * as admin from "firebase-admin";
-import { google, calendar_v3 } from 'googleapis'; // For Google Calendar API
 
 // --- Import Models ---
-import {
-    EventBooking, EventBookingStatus, User, AppConfigEventSettings, EventBookingItem // Added EventBookingItem
-} from '../models'; // Adjust path if needed
+import { EventBooking, EventBookingStatus } from '../models'; // Adjust path if needed
 
-// --- Assuming helper functions are imported or defined elsewhere ---
-// import { fetchEventSettings } from '../config/config_helpers';
-// import { getGoogleAuthClient } from '../utils/google_auth'; // Helper to get authenticated Google API client
-// import { sendPushNotification } from '../utils/notifications';
-// import { logAdminAction } from '../utils/logging'; // Log critical errors/actions
+// --- Import Helpers ---
+import { createGoogleCalendarEvent as createEventInGCal } from '../utils/google_calendar_helpers'; // <-- Import REAL helper
+// import { logSystemActivity } from '../utils/logging'; // Using mock below
 
-// --- Mocks for required helper functions (Replace with actual implementations) ---
-interface EventSettings { timeZone?: string; targetCalendarIds?: { [key: string]: string }; googleCalendarIntegrationEnabled?: boolean; /* Add other settings */ }
-async function fetchEventSettings(): Promise<EventSettings | null> { logger.info(`[Mock Config] Fetching event settings`); return { timeZone: 'Asia/Jerusalem', targetCalendarIds: { default: 'primary' }, googleCalendarIntegrationEnabled: true }; }
-async function getGoogleAuthClient(): Promise<any> { logger.info(`[Mock Google Auth] Getting authenticated client`); /* Simulate auth */ return google.calendar({ version: 'v3', auth: 'mock-auth-client' }); } // Return a mock client
-interface AdminAlertParams { subject: string; body: string; bookingId?: string; severity: "critical" | "warning" | "info"; }
-async function sendPushNotification(params: AdminAlertParams): Promise<void> { logger.info(`[Mock Notification] Sending ADMIN ALERT (${params.severity})`, params); }
-async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); }
+// --- Mocks ---
+async function logSystemActivity(actionType: string, details: object): Promise<void> { logger.info(`[Mock System Log] Action: ${actionType}`, details); }
 // --- End Mocks ---
 
 // --- Configuration ---
-// Ensure Firebase Admin is initialized (moved to index.ts)
 const db = admin.firestore();
-const { FieldValue } = admin.firestore;
 const FUNCTION_REGION = "me-west1"; // <<<--- CHANGE TO YOUR REGION
+// Choose ONE trigger type: Firestore or Pub/Sub
 
-const functionConfig = {
-    region: FUNCTION_REGION,
-    memory: "512MiB" as const, // Allow memory for GCal API calls
-    timeoutSeconds: 60,
-    // ** IMPORTANT: Configure Pub/Sub retries & DLQ for this topic **
-    // secrets: ["GOOGLE_API_CREDENTIALS"], // If using service account credentials for GCal
-};
+// Option 1: Firestore Trigger (Simpler, but less robust for external API calls)
+// Triggered when an event booking's status changes, specifically looking for transition to 'Confirmed'.
+/*
+export const createGoogleCalendarEvent = functions.firestore
+    .document('eventBookings/{bookingId}')
+    .region(FUNCTION_REGION)
+    .onUpdate(async (change, context): Promise<void> => {
+        const functionName = "[createGoogleCalendarEvent - Firestore Trigger V2]";
+        const bookingId = context.params.bookingId;
+        const beforeData = change.before.data() as EventBooking | undefined;
+        const afterData = change.after.data() as EventBooking | undefined;
+        const logContext = { functionName, trigger: "Firestore", bookingId };
 
-// Ensure this matches the Pub/Sub topic triggered by confirmEventAgreement
-const PUBSUB_TOPIC = "create-gcal-event"; // <<<--- CHANGE TO YOUR TOPIC NAME
+        if (!afterData) {
+            logger.info(`${functionName} Booking ${bookingId} deleted. No action needed.`, logContext);
+            return;
+        }
 
-// --- Enums ---
-enum ErrorCode {
-    BookingNotFound = "BOOKING_NOT_FOUND",
-    InvalidBookingStatus = "INVALID_BOOKING_STATUS", // Not Confirmed
-    GCalIntegrationDisabled = "GCAL_INTEGRATION_DISABLED",
-    MissingCalendarId = "MISSING_CALENDAR_ID",
-    GoogleCalendarError = "GOOGLE_CALENDAR_ERROR", // General GCal API error
-    InternalError = "INTERNAL_ERROR",
-}
+        const beforeStatus = beforeData?.bookingStatus;
+        const afterStatus = afterData.bookingStatus;
+        logContext.beforeStatus = beforeStatus;
+        logContext.afterStatus = afterStatus;
 
-// --- The Cloud Function (Pub/Sub Triggered - V2) ---
-export const createGoogleCalendarEvent = functions.pubsub
-    .topic(PUBSUB_TOPIC)
-    .onMessagePublished(
-        {
-            ...functionConfig,
-            // Ensure Pub/Sub Subscription has retry policy and Dead Letter Topic configured!
-        },
-        async (message): Promise<void> => {
-            const functionName = "[createGoogleCalendarEvent V1]";
-            const startTimeFunc = Date.now();
-            const messageId = message.id;
+        // --- Trigger Condition ---
+        // Create event only when status becomes 'Confirmed' (or maybe 'Scheduled' depending on flow)
+        // and it wasn't already 'Confirmed'/'Scheduled' before.
+        const targetStatus = EventBookingStatus.Confirmed; // Or Scheduled?
+        if (afterStatus !== targetStatus || beforeStatus === targetStatus) {
+             logger.debug(`${functionName} Status did not transition to ${targetStatus}. No action needed.`, logContext);
+             return;
+        }
+         // Check if event already created to prevent duplicates
+         if (afterData.googleCalendarEventId) {
+             logger.warn(`${functionName} Booking ${bookingId} already has a Google Calendar Event ID (${afterData.googleCalendarEventId}). Skipping creation.`, logContext);
+             return;
+         }
 
-            let bookingId: string;
-            let bookingRef: admin.firestore.DocumentReference;
-            const logContext: any = { messageId };
+        logger.info(`${functionName} Processing confirmed booking ${bookingId} to create GCal event...`, logContext);
 
-            try {
-                // 1. Extract bookingId & Fetch Booking
-                if (!message.json?.bookingId || typeof message.json.bookingId !== 'string') {
-                    logger.error(`${functionName} Invalid Pub/Sub payload: Missing/invalid 'bookingId'. ACK.`, { messageData: message.json, messageId });
-                    return; // ACK bad format
-                }
-                bookingId = message.json.bookingId;
-                logContext.bookingId = bookingId;
-                logger.info(`${functionName} Invoked for booking ${bookingId}`, logContext);
+        try {
+            // --- Prepare Event Data ---
+            const eventInput = {
+                summary: `Event Booking: ${bookingId}`, // Customize summary
+                description: `Customer: ${afterData.customerId}\nNotes: ${afterData.notes || 'N/A'}\nStatus: ${afterData.bookingStatus}`, // Customize description
+                startTime: afterData.startTime,
+                endTime: afterData.endTime,
+                location: afterData.location?.address || undefined, // Use address string if available
+                // attendees: [afterData.customerEmail], // Add customer email if available and desired
+                bookingId: bookingId, // Pass bookingId for reference
+                // timeZone: 'Asia/Jerusalem', // Handled by helper default
+            };
 
-                bookingRef = db.collection('eventBookings').doc(bookingId);
-                const bookingSnap = await bookingRef.get();
+            // --- Call Helper to Create Event ---
+            const result = await createEventInGCal(eventInput);
 
-                if (!bookingSnap.exists) {
-                    logger.error(`${functionName} Booking ${bookingId}: Not found. ACK.`, logContext);
-                    return; // ACK - booking deleted?
-                }
-                const bookingData = bookingSnap.data() as EventBooking;
-                logContext.currentBookingStatus = bookingData.bookingStatus;
-                logContext.customerId = bookingData.customerId;
-
-                // 2. Validate Status & Idempotency
-                // Expecting 'Confirmed' status set by confirmEventAgreement
-                if (bookingData.bookingStatus !== EventBookingStatus.Confirmed) {
-                    logger.warn(`${functionName} Booking ${bookingId}: Invalid status '${bookingData.bookingStatus}'. Expected '${EventBookingStatus.Confirmed}'. ACK.`, logContext);
-                    return; // ACK - Booking not confirmed, don't create GCal event
-                }
-                if (bookingData.googleCalendarEventId) {
-                     logger.info(`${functionName} Booking ${bookingId}: Google Calendar event already exists (${bookingData.googleCalendarEventId}). ACK.`, logContext);
-                     return; // ACK - Idempotency check
-                }
-
-                // 3. Fetch Settings & Customer Data
-                const settingsPromise = fetchEventSettings();
-                const customerSnapPromise = db.collection('users').doc(bookingData.customerId).get();
-                const [settings, customerSnap] = await Promise.all([settingsPromise, customerSnapPromise]);
-
-                if (!settings?.googleCalendarIntegrationEnabled) {
-                    logger.info(`${functionName} Booking ${bookingId}: Google Calendar integration is disabled in settings. ACK.`, logContext);
-                    // Optionally update booking to indicate GCal was skipped due to settings?
-                    // await bookingRef.update({ needsManualGcalCheck: true, processingError: "GCal integration disabled" });
-                    return; // ACK
-                }
-
-                const calendarId = settings.targetCalendarIds?.default ?? 'primary';
-                if (!calendarId) {
-                    logger.error(`${functionName} Booking ${bookingId}: Target Google Calendar ID not configured in settings. ACK.`, logContext);
-                    await bookingRef.update({ needsManualGcalCheck: true, processingError: "Target GCal ID missing in config" }).catch(err => logger.error("Failed update booking", {err}));
-                    sendPushNotification({ subject: `GCal Creation Failed (Config) - Booking ${bookingId}`, body: `Failed to create GCal event for booking ${bookingId}. Target Calendar ID is missing in event settings. Manual creation required.`, bookingId, severity: "critical" }).catch(...);
-                    return; // ACK
-                }
-                logContext.calendarId = calendarId;
-
-                let customerName = `Customer ${bookingData.customerId.substring(0, 6)}`;
-                let customerEmail: string | undefined;
-                if (customerSnap.exists) {
-                    const customerData = customerSnap.data() as User;
-                    customerName = customerData.displayName ?? customerName;
-                    customerEmail = customerData.email ?? undefined;
-                } else {
-                    logger.warn(`${functionName} Customer ${bookingData.customerId} not found for booking ${bookingId}. Proceeding without customer details in GCal event.`);
-                }
-                logContext.customerName = customerName;
-                logContext.customerEmail = customerEmail;
-
-                // 4. Prepare Google Calendar Event Data
-                const eventStartTime = bookingData.startTime.toDate();
-                const eventEndTime = bookingData.endTime.toDate();
-                const timeZone = settings.timeZone ?? 'UTC'; // Use configured timezone
-
-                // Construct description
-                let description = `Event Booking ID: ${bookingId}\n`;
-                description += `Customer: ${customerName} (${bookingData.customerId})\n`;
-                if (customerEmail) description += `Email: ${customerEmail}\n`;
-                if (bookingData.notes) description += `\nCustomer Notes:\n${bookingData.notes}\n`;
-                description += `\nItems:\n`;
-                bookingData.selectedItems.forEach((item: EventBookingItem) => {
-                    description += `- ${item.productName || item.itemId} (${item.itemType})`;
-                    if (item.quantity) description += ` x ${item.quantity}`;
-                    if (item.durationHours) description += ` for ${item.durationHours} hours`;
-                    description += `\n`;
-                });
-                // Add total amount?
-                description += `\nTotal: ${(bookingData.totalAmountSmallestUnit / 100).toFixed(2)} ${bookingData.currencyCode}`;
-
-
-                const gcalEvent: calendar_v3.Schema$Event = {
-                    summary: `Urban Coconuts Event: ${customerName}`,
-                    description: description,
-                    start: {
-                        dateTime: eventStartTime.toISOString(),
-                        timeZone: timeZone,
-                    },
-                    end: {
-                        dateTime: eventEndTime.toISOString(),
-                        timeZone: timeZone,
-                    },
-                    location: bookingData.location?.address ?? 'Location TBD',
-                    // Add attendees? (Customer, relevant internal staff/resources if emails are available)
-                    attendees: customerEmail ? [{ email: customerEmail, displayName: customerName }] : [],
-                    // Add reminders?
-                    reminders: {
-                        useDefault: false,
-                        overrides: [
-                            { method: 'popup', minutes: 60 }, // 1 hour before
-                            { method: 'popup', minutes: 24 * 60 }, // 1 day before
-                        ],
-                    },
-                    // Link back to the booking in your system? Use extendedProperties
-                    extendedProperties: {
-                        private: { // Private properties not visible to attendees
-                            urbanCoconutsBookingId: bookingId,
-                            urbanCoconutsCustomerId: bookingData.customerId,
-                        }
-                    },
-                    // Set color, status etc. if desired
-                    // colorId: '5', // Example: Yellow
-                    status: 'confirmed', // Mark as confirmed in GCal
-                };
-
-                // 5. Insert Event into Google Calendar
-                logger.info(`${functionName} Inserting event into Google Calendar ${calendarId}...`, logContext);
-                const calendar = await getGoogleAuthClient(); // Get authenticated client
-                let createdEvent: calendar_v3.Schema$Event | null = null;
-
-                try {
-                    const response = await calendar.events.insert({
-                        calendarId: calendarId,
-                        requestBody: gcalEvent,
-                        // sendNotifications: true, // Send GCal invitations to attendees?
-                    });
-                    createdEvent = response.data;
-                    if (!createdEvent?.id) {
-                        throw new Error("Google Calendar API did not return an event ID.");
-                    }
-                    logger.info(`${functionName} Google Calendar event created successfully. Event ID: ${createdEvent.id}`, logContext);
-                } catch (gcalError: any) {
-                    logger.error(`${functionName} Error inserting event into Google Calendar.`, { ...logContext, error: gcalError.message, code: gcalError.code, errors: gcalError.errors });
-                    // Update booking status to indicate failure and need for manual check
-                    await bookingRef.update({ needsManualGcalCheck: true, processingError: `GCal Error: ${gcalError.message}` }).catch(err => logger.error("Failed update booking", {err}));
-                    sendPushNotification({ subject: `GCal Creation FAILED - Booking ${bookingId}`, body: `Failed to create GCal event for booking ${bookingId}. Reason: ${gcalError.message}. Manual creation required.`, bookingId, severity: "critical" }).catch(...);
-                    // Rethrow to potentially trigger Pub/Sub retry? Or ACK? Let's ACK to avoid loops on persistent GCal errors.
-                    // throw new HttpsError('internal', `Google Calendar API error: ${gcalError.message}`, { errorCode: ErrorCode.GoogleCalendarError });
-                    return; // ACK
-                }
-
-                // 6. Update Booking with GCal Event ID
-                logger.info(`${functionName} Updating booking ${bookingId} with GCal Event ID ${createdEvent.id}...`, logContext);
+            // --- Update Booking with Event ID or Error ---
+            const bookingRef = db.collection('eventBookings').doc(bookingId);
+            if (result.success && result.eventId) {
+                logger.info(`${functionName} GCal event created (${result.eventId}). Updating booking ${bookingId}.`, logContext);
                 await bookingRef.update({
-                    googleCalendarEventId: createdEvent.id,
+                    googleCalendarEventId: result.eventId,
                     needsManualGcalCheck: false, // Clear flag if previously set
-                    processingError: null, // Clear previous errors
                     updatedAt: FieldValue.serverTimestamp(),
                 });
-
-                logAdminAction("CreateGoogleCalendarEventSuccess", { bookingId, gcalEventId: createdEvent.id, calendarId });
-
-
-            } catch (error: any) {
-                // 7. Handle Internal Function Errors
-                const errorMessage = error.message || "An unknown internal error occurred.";
-                const errorCode = Object.values(ErrorCode).includes(errorMessage as ErrorCode) ? errorMessage as ErrorCode : ErrorCode.InternalError;
-                logger.error(`${functionName} Booking ${bookingId}: Unhandled internal error. Error Code: ${errorCode}`, { error: errorMessage, messageId });
-
-                // Attempt to update booking status to indicate failure
-                try {
-                     if (bookingId) { // Ensure bookingId is defined
-                         await db.collection('eventBookings').doc(bookingId).update({
-                             needsManualGcalCheck: true,
-                             processingError: `Internal GCal function error (${errorCode}): ${errorMessage.substring(0, 200)}`,
-                             updatedAt: FieldValue.serverTimestamp()
-                         });
-                     }
-                } catch (updateError: any) {
-                    logger.error(`${functionName} Booking ${bookingId}: FAILED to update booking status after internal error.`, { updateError });
-                }
-                logAdminAction("CreateGoogleCalendarEventFailedInternal", { bookingId: bookingId || 'Unknown', messageId: messageId, errorMessage: errorMessage, errorCode: errorCode }).catch(...);
-                // Throw the original error to trigger Pub/Sub retries for internal errors
-                throw error;
+            } else {
+                logger.error(`${functionName} Failed to create GCal event for booking ${bookingId}. Updating booking with error flag.`, { ...logContext, error: result.error });
+                await bookingRef.update({
+                    googleCalendarEventId: null, // Ensure it's null
+                    needsManualGcalCheck: true, // Flag for manual intervention
+                    processingError: `GCal Create Failed: ${result.error || result.errorCode || 'Unknown'}`,
+                    updatedAt: FieldValue.serverTimestamp(),
+                });
             }
-            // Successful completion implicitly ACKs the message
-             logger.info(`${functionName} Execution finished for booking ${bookingId}. Duration: ${Date.now() - startTimeFunc}ms`, { messageId });
+             // Log system activity
+             logSystemActivity("CreateGCalEventAttempt", { bookingId, success: result.success, eventId: result.eventId, error: result.error }).catch(...)
 
-        }); // End onMessagePublished
+
+        } catch (error: any) {
+            logger.error(`${functionName} Unhandled error processing booking ${bookingId}.`, { ...logContext, error: error.message, stack: error.stack });
+            // Attempt to mark booking with error flag
+             try {
+                 await db.collection('eventBookings').doc(bookingId).update({
+                     needsManualGcalCheck: true,
+                     processingError: `Fatal GCal Create Error: ${error?.message ?? 'Unknown'}`,
+                     updatedAt: FieldValue.serverTimestamp(),
+                 });
+             } catch (updateError) {
+                  logger.error(`${functionName} Failed to update booking ${bookingId} with fatal error info.`, { ...logContext, updateError });
+             }
+        }
+    });
+*/
+
+// Option 2: Pub/Sub Trigger (More Robust for external APIs)
+// Assumes another function (e.g., confirmEventAgreement) publishes the bookingId to this topic.
+const EVENT_CALENDAR_TOPIC = "create-google-calendar-event"; // Example topic name
+
+export const createGoogleCalendarEvent = functions.pubsub.topic(EVENT_CALENDAR_TOPIC)
+    .region(FUNCTION_REGION)
+    .onPublish(async (message): Promise<void> => {
+        const functionName = "[createGoogleCalendarEvent - PubSub Trigger V2]";
+        const startTimeFunc = Date.now();
+        let bookingId: string | null = null;
+        let logContext: any = { functionName, trigger: "Pub/Sub", topic: EVENT_CALENDAR_TOPIC };
+
+        try {
+            // 1. Parse Message Payload
+            let payload: { bookingId: string };
+            try {
+                payload = message.json as { bookingId: string };
+                bookingId = payload.bookingId;
+                if (!bookingId) throw new Error("Missing bookingId in Pub/Sub message payload.");
+                logContext.bookingId = bookingId;
+                logger.info(`${functionName} Received request to create GCal event.`, logContext);
+            } catch (e: any) {
+                logger.error(`${functionName} Failed to parse Pub/Sub message.`, { error: e.message, data: message.data ? Buffer.from(message.data, 'base64').toString() : null });
+                return; // Acknowledge invalid message
+            }
+
+            // 2. Fetch Event Booking Data
+            const bookingRef = db.collection('eventBookings').doc(bookingId);
+            const bookingSnap = await bookingRef.get();
+
+            if (!bookingSnap.exists) {
+                logger.error(`${functionName} Event booking ${bookingId} not found.`, logContext);
+                return; // Acknowledge - cannot process
+            }
+            const bookingData = bookingSnap.data() as EventBooking;
+            logContext.currentStatus = bookingData.bookingStatus;
+
+            // 3. State Validation (Optional but recommended)
+            // Ensure the booking is in a state where calendar creation makes sense
+            const validStatuses = [EventBookingStatus.Confirmed, EventBookingStatus.Scheduled]; // Add others if needed
+            if (!validStatuses.includes(bookingData.bookingStatus)) {
+                 logger.warn(`${functionName} Booking ${bookingId} is not in a valid status for GCal creation (current: ${bookingData.bookingStatus}). Skipping.`, logContext);
+                 return; // Acknowledge - wrong state
+            }
+            // Prevent duplicate creation
+            if (bookingData.googleCalendarEventId) {
+                logger.warn(`${functionName} Booking ${bookingId} already has a Google Calendar Event ID (${bookingData.googleCalendarEventId}). Skipping creation.`, logContext);
+                return; // Acknowledge - already done
+            }
+
+            // 4. Prepare Event Data
+             const eventInput = {
+                 summary: `Event: ${bookingData.eventMenuId || 'Custom'} - ${bookingId.substring(0,6)}`, // Example summary
+                 description: `Customer: ${bookingData.customerId}\nBooking ID: ${bookingId}\nNotes: ${bookingData.notes || 'N/A'}\nStatus: ${bookingData.bookingStatus}`,
+                 startTime: bookingData.startTime,
+                 endTime: bookingData.endTime,
+                 location: bookingData.location?.address || undefined,
+                 // attendees: [customerEmail], // Fetch customer email if needed
+                 bookingId: bookingId,
+             };
+
+            // 5. Call Helper to Create Event
+            logger.info(`${functionName} Calling GCal helper to create event for booking ${bookingId}...`, logContext);
+            const result = await createEventInGCal(eventInput);
+
+            // 6. Update Booking with Event ID or Error
+            if (result.success && result.eventId) {
+                logger.info(`${functionName} GCal event created (${result.eventId}). Updating booking ${bookingId}.`, logContext);
+                await bookingRef.update({
+                    googleCalendarEventId: result.eventId,
+                    needsManualGcalCheck: false,
+                    updatedAt: FieldValue.serverTimestamp(),
+                });
+            } else {
+                logger.error(`${functionName} Failed to create GCal event for booking ${bookingId}. Updating booking with error flag.`, { ...logContext, error: result.error });
+                await bookingRef.update({
+                    googleCalendarEventId: null,
+                    needsManualGcalCheck: true,
+                    processingError: `GCal Create Failed: ${result.error || result.errorCode || 'Unknown'}`,
+                    updatedAt: FieldValue.serverTimestamp(),
+                });
+            }
+             // Log system activity
+             logSystemActivity("CreateGCalEventAttempt", { bookingId, success: result.success, eventId: result.eventId, error: result.error }).catch(...)
+
+
+        } catch (error: any) {
+            logger.error(`${functionName} Unhandled error processing booking ${bookingId}.`, { ...logContext, error: error.message, stack: error.stack });
+             // Attempt to mark booking with error flag
+              if (bookingId) {
+                  try {
+                      await db.collection('eventBookings').doc(bookingId).update({
+                          needsManualGcalCheck: true,
+                          processingError: `Fatal GCal Create Error: ${error?.message ?? 'Unknown'}`,
+                          updatedAt: FieldValue.serverTimestamp(),
+                      });
+                  } catch (updateError) {
+                       logger.error(`${functionName} Failed to update booking ${bookingId} with fatal error info.`, { ...logContext, updateError });
+                  }
+              }
+        } finally {
+             const duration = Date.now() - startTimeFunc;
+             logger.info(`${functionName} Execution finished. Duration: ${duration}ms`, logContext);
+        }
+    });
+
