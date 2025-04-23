@@ -10,15 +10,14 @@ import {
 } from '../models'; // Adjust path if needed
 
 // --- Import Helpers ---
-import { checkPermission } from '../utils/permissions'; // <-- Import REAL helper
-// import { calculateOrderTotal } from '../utils/order_calculations'; // Still using mock below
-// import { logUserActivity } from '../utils/logging'; // Still using mock below
+import { checkPermission } from '../utils/permissions';
 import { initiateAuthorization, extractPaymentDetailsFromResult } from '../utils/payment_helpers';
+import { logUserActivity } from '../utils/logging'; // Using mock below
 
 // --- Mocks for other required helper functions (Replace with actual implementations) ---
 interface CalculationResult { totalAmount: number; itemsTotal: number; couponDiscount: number; ucCoinDiscount: number; finalAmount: number; error?: string; }
 function calculateOrderTotal(items: Array<{ productId: string; quantity: number; unitPrice: number }>, coupon?: any | null, ucCoinsToUse?: number | null, userCoinBalance?: number, tipAmount?: number): CalculationResult { logger.info(`[Mock Calc] Calculating total...`); const itemsTotal = items.reduce((sum, item) => sum + (item.unitPrice * item.quantity), 0); const couponDiscount = coupon ? 500 : 0; const ucCoinDiscount = Math.min(ucCoinsToUse ?? 0, userCoinBalance ?? 0); const finalAmount = itemsTotal - couponDiscount - ucCoinDiscount + (tipAmount ?? 0); return { totalAmount: itemsTotal, itemsTotal, couponDiscount, ucCoinDiscount, finalAmount }; }
-async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); }
+// async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); } // Imported
 // --- End Mocks ---
 
 // --- Configuration ---
@@ -102,15 +101,15 @@ export const createOrder = functions.https.onCall(
 
         // --- Variables ---
         let userData: User;
-        let userRole: string | null; // We'll fetch this now
+        let userRole: string | null;
         let boxData: Box;
-        let fetchedProducts = new Map<string, Product>(); // Map product IDs to product data
+        let fetchedProducts = new Map<string, Product>();
         let orderItems: OrderItem[] = [];
         let calculationResult: CalculationResult;
         let authorizationResult: Awaited<ReturnType<typeof initiateAuthorization>> | null = null;
         let paymentStatus: PaymentStatus;
         let authDetails: PaymentDetails | null = null;
-        const orderId = db.collection('orders').doc().id; // Pre-generate order ID
+        const orderId = db.collection('orders').doc().id;
 
         try {
             // 3. Fetch User, Box, and Product Data Concurrently
@@ -123,23 +122,20 @@ export const createOrder = functions.https.onCall(
             const [userSnap, boxSnap, ...productDocs] = await Promise.all([
                 userRef.get(),
                 boxRef.get(),
-                ...productRefs.map(ref => ref.get()) // Fetch all products
+                ...productRefs.map(ref => ref.get())
             ]);
 
-            // Validate User
             if (!userSnap.exists) throw new HttpsError('not-found', `error.user.notFound::${customerId}`, { errorCode: ErrorCode.UserNotFound });
             userData = userSnap.data() as User;
-            userRole = userData.role; // Get the role from user data
+            userRole = userData.role;
             logContext.userRole = userRole;
             if (!userData.isActive) throw new HttpsError('permission-denied', "error.user.inactive", { errorCode: ErrorCode.PermissionDenied });
 
-            // Validate Box
             if (!boxSnap.exists) throw new HttpsError('not-found', `error.box.notFound::${boxId}`, { errorCode: ErrorCode.BoxNotFound });
             boxData = boxSnap.data() as Box;
             logContext.currencyCode = boxData.currencyCode;
             if (!boxData.isActive) throw new HttpsError('failed-precondition', `error.box.inactive::${boxId}`, { errorCode: ErrorCode.BoxInactive });
 
-            // Validate Products and build OrderItems list
             productDocs.forEach((doc, index) => {
                 const productId = productIds[index];
                 if (!doc.exists) throw new HttpsError('not-found', `error.product.notFound::${productId}`, { errorCode: ErrorCode.ProductNotFound });
@@ -159,8 +155,7 @@ export const createOrder = functions.https.onCall(
                 });
             });
 
-            // 4. Permission Check (Using REAL helper)
-            // Pass the fetched role to avoid redundant DB read inside checkPermission
+            // 4. Permission Check
             const hasPermission = await checkPermission(customerId, userRole, 'order:create', logContext);
             if (!hasPermission) {
                 logger.warn(`${functionName} Permission denied for user ${customerId} (Role: ${userRole}) to create order.`, logContext);
@@ -170,10 +165,7 @@ export const createOrder = functions.https.onCall(
             // 5. Calculate Order Totals
             logger.info(`${functionName} Calculating order totals...`, logContext);
             calculationResult = calculateOrderTotal(
-                orderItems,
-                couponCode ? { couponCode } : null,
-                ucCoinsToUse,
-                userData.ucCoinBalance
+                orderItems, couponCode ? { couponCode } : null, ucCoinsToUse, userData.ucCoinBalance
             );
             if (calculationResult.error) {
                 throw new HttpsError('internal', `error.internal.calculation::${calculationResult.error}`, { errorCode: ErrorCode.CalculationError });
@@ -185,7 +177,7 @@ export const createOrder = functions.https.onCall(
                  throw new HttpsError('internal', "Calculation resulted in negative final amount.");
             }
 
-            // 6. Handle Payment Authorization (if applicable)
+            // 6. Handle Payment Authorization
             paymentStatus = PaymentStatus.Pending;
             if (paymentMethod === PaymentMethod.CreditCardApp || paymentMethod === PaymentMethod.BitApp) {
                 if (finalAmount > 0) {
@@ -224,7 +216,7 @@ export const createOrder = functions.https.onCall(
             }
             logContext.paymentStatus = paymentStatus;
 
-            // 7. Firestore Transaction to Create Order and Update Inventory/User Balance
+            // 7. Firestore Transaction
             logger.info(`${functionName} Starting Firestore transaction...`, logContext);
             await db.runTransaction(async (transaction) => {
                 const boxTxSnap = await transaction.get(boxRef);
@@ -256,35 +248,16 @@ export const createOrder = functions.https.onCall(
                 const now = Timestamp.now();
                 const initialStatus = OrderStatus.Red;
                 const newOrderData: Order = {
-                    orderId: orderId,
-                    orderNumber: `UC-${orderId.substring(0, 6).toUpperCase()}`,
-                    customerId: customerId,
-                    courierId: null,
-                    boxId: boxId,
-                    items: orderItems,
-                    status: initialStatus,
+                    orderId: orderId, orderNumber: `UC-${orderId.substring(0, 6).toUpperCase()}`, customerId: customerId,
+                    courierId: null, boxId: boxId, items: orderItems, status: initialStatus,
                     statusHistory: [{ status: initialStatus, timestamp: now, userId: customerId, role: userRole ?? 'Customer', reason: "Order created" }],
-                    paymentMethod: paymentMethod,
-                    paymentStatus: paymentStatus,
-                    currencyCode: boxData.currencyCode,
-                    authDetails: authDetails,
-                    paymentDetails: null,
-                    totalAmount: totalAmount,
-                    ucCoinsUsed: ucCoinDiscount > 0 ? ucCoinDiscount : null,
-                    couponCodeUsed: couponCode || null,
-                    couponDiscountValue: couponDiscount,
-                    tipAmountSmallestUnit: null,
-                    finalAmount: finalAmount,
-                    orderTimestamp: now,
-                    deliveredTimestamp: null,
-                    pickupTimeWindow: null,
-                    notes: notes || null,
-                    issueReported: false,
-                    issueDetails: null,
-                    orderQrCodeData: `UCO:${orderId}`,
-                    cancellationSideEffectsProcessed: false,
-                    createdAt: now,
-                    updatedAt: now,
+                    paymentMethod: paymentMethod, paymentStatus: paymentStatus, currencyCode: boxData.currencyCode,
+                    authDetails: authDetails, paymentDetails: null, totalAmount: totalAmount,
+                    ucCoinsUsed: ucCoinDiscount > 0 ? ucCoinDiscount : null, couponCodeUsed: couponCode || null,
+                    couponDiscountValue: couponDiscount, tipAmountSmallestUnit: null, finalAmount: finalAmount,
+                    orderTimestamp: now, deliveredTimestamp: null, pickupTimeWindow: null, notes: notes || null,
+                    issueReported: false, issueDetails: null, orderQrCodeData: `UCO:${orderId}`,
+                    cancellationSideEffectsProcessed: false, createdAt: now, updatedAt: now,
                 };
                 const orderRef = db.collection('orders').doc(orderId);
                 transaction.set(orderRef, newOrderData);
@@ -297,12 +270,11 @@ export const createOrder = functions.https.onCall(
 
             // 8. Log User Activity (Async)
             logUserActivity("CreateOrder", { orderId, boxId, itemCount: orderItems.length, finalAmount, paymentMethod, paymentStatus }, customerId)
-                .catch(err => logger.error("Failed logging user activity", { err }));
+                .catch(err => logger.error("Failed logging CreateOrder user activity", { err })); // Fixed catch
 
-            // 9. Return Success (potentially with action required)
+            // 9. Return Success
             const successResponse: { success: true; orderId: string; requiresAction?: boolean; actionUrl?: string } = {
-                 success: true,
-                 orderId: orderId
+                 success: true, orderId: orderId
             };
             if (paymentStatus === PaymentStatus.AuthorizationActionRequired && authorizationResult?.requiresAction) {
                  successResponse.requiresAction = true;
@@ -330,7 +302,8 @@ export const createOrder = functions.https.onCall(
                  if (parts[2]) finalErrorMessageKey += `::${parts[2]}`;
             }
 
-            logUserActivity("CreateOrderFailed", { boxId, itemCount: cartItems.length, paymentMethod, error: error.message }, customerId).catch(...)
+            logUserActivity("CreateOrderFailed", { boxId, itemCount: cartItems.length, paymentMethod, error: error.message }, customerId)
+                .catch(err => logger.error("Failed logging CreateOrderFailed user activity", { err })); // Fixed catch
 
             return { success: false, error: finalErrorMessageKey, errorCode: finalErrorCode };
         } finally {
