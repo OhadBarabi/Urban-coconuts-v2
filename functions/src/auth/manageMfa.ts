@@ -11,11 +11,11 @@ import { User } from '../models'; // Adjust path if needed
 // --- Import Helpers ---
 import { encryptMfaSecret, decryptMfaSecret } from '../utils/encryption';
 // import { checkPermission } from '../utils/permissions'; // No specific permission needed beyond auth for these user actions
-// import { logUserActivity, logAdminAction } from '../utils/logging'; // Using mocks below
+import { logUserActivity, logAdminAction } from '../utils/logging'; // Using mocks below
 
 // --- Mocks for other required helper functions (Replace with actual implementations) ---
-async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); }
-async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); }
+// async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); } // Already imported
+// async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); } // Already imported
 // --- End Mocks ---
 
 // --- Configuration ---
@@ -59,7 +59,7 @@ interface VerifyMfaInput {
 export const generateMfaSetup = functions.https.onCall(
     { region: FUNCTION_REGION, memory: "256MiB" },
     async (request): Promise<{ success: true; data: GenerateMfaSetupOutput } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[generateMfaSetup V3 - Permissions]"; // Updated version name
+        const functionName = "[generateMfaSetup V3 - Permissions]";
         const startTimeFunc = Date.now();
 
         // 1. Authentication (Implicitly checked by onCall)
@@ -67,8 +67,6 @@ export const generateMfaSetup = functions.https.onCall(
         const userId = request.auth.uid;
         const logContext: any = { userId };
         logger.info(`${functionName} Invoked.`, logContext);
-
-        // No specific permission check needed beyond being authenticated
 
         try {
             // 2. Generate Speakeasy Secret
@@ -115,7 +113,7 @@ export const generateMfaSetup = functions.https.onCall(
 export const verifyMfaSetup = functions.https.onCall(
     { region: FUNCTION_REGION, memory: "512MiB" },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[verifyMfaSetup V3 - Permissions]"; // Updated version name
+        const functionName = "[verifyMfaSetup V3 - Permissions]";
         const startTimeFunc = Date.now();
 
         // 1. Authentication
@@ -134,8 +132,6 @@ export const verifyMfaSetup = functions.https.onCall(
             return { success: false, error: "error.invalidInput.mfaTokenOrSecret", errorCode: ErrorCode.InvalidArgument };
         }
         const { token, secret } = data;
-
-        // No specific permission check needed beyond being authenticated
 
         try {
             // 3. Verify Token against the provided Secret
@@ -171,7 +167,8 @@ export const verifyMfaSetup = functions.https.onCall(
             logger.info(`${functionName} MFA setup verified and enabled successfully for user ${userId}.`, logContext);
 
             // 6. Log User Activity (Async)
-            logUserActivity("EnableMfaSuccess", { method: "TOTP" }, userId).catch(err => logger.error("Failed logging user activity", { err }));
+            logUserActivity("EnableMfaSuccess", { method: "TOTP" }, userId)
+                .catch(err => logger.error("Failed logging EnableMfaSuccess user activity", { err })); // Fixed catch
 
             return { success: true };
 
@@ -188,7 +185,8 @@ export const verifyMfaSetup = functions.https.onCall(
                  finalErrorMessageKey = "error.mfa.invalidToken";
             }
 
-            logUserActivity("EnableMfaFailed", { method: "TOTP", error: error.message }, userId).catch(...)
+            logUserActivity("EnableMfaFailed", { method: "TOTP", error: error.message }, userId)
+                .catch(err => logger.error("Failed logging EnableMfaFailed user activity", { err })); // Fixed catch
 
             return { success: false, error: finalErrorMessageKey, errorCode: finalErrorCode };
         } finally {
@@ -204,7 +202,7 @@ export const verifyMfaSetup = functions.https.onCall(
 export const disableMfa = functions.https.onCall(
     { region: FUNCTION_REGION, memory: "128MiB" },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[disableMfa V3 - Permissions]"; // Updated version name
+        const functionName = "[disableMfa V3 - Permissions]";
         const startTimeFunc = Date.now();
 
         // 1. Authentication
@@ -212,8 +210,6 @@ export const disableMfa = functions.https.onCall(
         const userId = request.auth.uid;
         const logContext: any = { userId };
         logger.info(`${functionName} Invoked.`, logContext);
-
-        // No specific permission check needed beyond being authenticated
 
         try {
             // 2. Fetch User Data to check current status
@@ -236,7 +232,8 @@ export const disableMfa = functions.https.onCall(
             logger.info(`${functionName} MFA disabled successfully for user ${userId}.`, logContext);
 
             // 4. Log User Activity (Async)
-            logUserActivity("DisableMfaSuccess", {}, userId).catch(err => logger.error("Failed logging user activity", { err }));
+            logUserActivity("DisableMfaSuccess", {}, userId)
+                .catch(err => logger.error("Failed logging DisableMfaSuccess user activity", { err })); // Fixed catch
 
             return { success: true };
 
@@ -246,7 +243,8 @@ export const disableMfa = functions.https.onCall(
             if (error instanceof HttpsError && error.details?.errorCode) {
                  finalErrorCode = error.details.errorCode as ErrorCode;
             }
-            logUserActivity("DisableMfaFailed", { error: error.message }, userId).catch(...)
+            logUserActivity("DisableMfaFailed", { error: error.message }, userId)
+                .catch(err => logger.error("Failed logging DisableMfaFailed user activity", { err })); // Fixed catch
             return { success: false, error: "error.mfa.disableFailed", errorCode: finalErrorCode };
         } finally {
             logger.info(`${functionName} Execution finished. Duration: ${Date.now() - startTimeFunc}ms`, logContext);
@@ -261,7 +259,7 @@ export const disableMfa = functions.https.onCall(
 export const verifyMfaLogin = functions.https.onCall(
     { region: FUNCTION_REGION, memory: "512MiB" },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[verifyMfaLogin V3 - Permissions]"; // Updated version name
+        const functionName = "[verifyMfaLogin V3 - Permissions]";
         const startTimeFunc = Date.now();
 
         // 1. Authentication
@@ -278,8 +276,6 @@ export const verifyMfaLogin = functions.https.onCall(
             return { success: false, error: "error.invalidInput.mfaToken", errorCode: ErrorCode.InvalidArgument };
         }
         const { token } = data;
-
-        // No specific permission check needed beyond being authenticated
 
         try {
             // 3. Fetch User Data
@@ -314,7 +310,8 @@ export const verifyMfaLogin = functions.https.onCall(
 
             if (!verified) {
                 logger.warn(`${functionName} MFA login verification failed for user ${userId}. Invalid token.`, logContext);
-                 logUserActivity("MfaLoginFailed", { reason: "Invalid Token" }, userId).catch(...)
+                 logUserActivity("MfaLoginFailed", { reason: "Invalid Token" }, userId)
+                    .catch(err => logger.error("Failed logging MfaLoginFailed (Invalid Token) user activity", { err })); // Fixed catch
                 return { success: false, error: "error.mfa.invalidToken", errorCode: ErrorCode.InvalidMfaToken };
             }
             logContext.tokenVerified = true;
@@ -322,7 +319,8 @@ export const verifyMfaLogin = functions.https.onCall(
             logger.info(`${functionName} MFA login verification successful for user ${userId}.`, logContext);
 
             // 7. Log successful MFA step (optional)
-            logUserActivity("MfaLoginSuccess", {}, userId).catch(err => logger.error("Failed logging user activity", { err }));
+            logUserActivity("MfaLoginSuccess", {}, userId)
+                .catch(err => logger.error("Failed logging MfaLoginSuccess user activity", { err })); // Fixed catch
 
             return { success: true }; // Indicate MFA step passed
 
@@ -336,7 +334,8 @@ export const verifyMfaLogin = functions.https.onCall(
                  if (finalErrorCode === ErrorCode.DecryptionFailed) finalErrorMessageKey = "error.mfa.decryptionFailed";
              }
 
-            logUserActivity("MfaLoginFailed", { error: error.message }, userId).catch(...)
+            logUserActivity("MfaLoginFailed", { error: error.message }, userId)
+                .catch(err => logger.error("Failed logging MfaLoginFailed user activity", { err })); // Fixed catch
 
             return { success: false, error: finalErrorMessageKey, errorCode: finalErrorCode };
         } finally {
