@@ -14,7 +14,7 @@ import { User } from '../models'; // Adjust path if needed
 // import { encryptSecret, decryptSecret } from '../utils/encryption'; // CRITICAL: For storing the secret securely
 
 // --- Mocks for required helper functions (Replace with actual implementations) ---
-async function checkPermission(userId: string | null, userRole: string | null, permissionId: string, context?: any): Promise<boolean> { logger.info(`[Mock Auth] Check ${permissionId} for ${userId} (${userRole})`, context); return userId != null; } // Allow any logged-in user for setup/verify? Or restrict? Let's allow for now.
+async function checkPermission(userId: string | null, userRole: string | null, permissionId: string, context?: any): Promise<boolean> { logger.info(`[Mock Auth] Check ${permissionId} for ${userId} (${userRole})`, context); return userId != null; } // Allow any logged-in user for MFA actions? Or restrict? Let's allow for now.
 async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); }
 // CRITICAL MOCK: Replace with REAL encryption/decryption using Cloud KMS or similar
 async function encryptSecret(plainText: string): Promise<string> { logger.warn("[Mock Encrypt] Using mock encryption (Base64). REPLACE WITH KMS!"); return Buffer.from(plainText).toString('base64'); }
@@ -32,11 +32,12 @@ const MFA_ISSUER_NAME = "Urban Coconuts V2"; // Name shown in authenticator app
 enum ErrorCode {
     Unauthenticated = "UNAUTHENTICATED", PermissionDenied = "PERMISSION_DENIED", InvalidArgument = "INVALID_ARGUMENT",
     NotFound = "NOT_FOUND", // User not found or pending secret missing
-    FailedPrecondition = "FAILED_PRECONDITION", // MFA already enabled or pending secret expired
+    FailedPrecondition = "FAILED_PRECONDITION", // MFA already enabled/disabled or pending secret expired
     InternalError = "INTERNAL_ERROR",
     // Specific codes
     UserNotFound = "USER_NOT_FOUND",
     MfaAlreadyEnabled = "MFA_ALREADY_ENABLED",
+    MfaNotEnabled = "MFA_NOT_ENABLED", // Added for disableMfa
     SecretGenerationFailed = "SECRET_GENERATION_FAILED",
     EncryptionFailed = "ENCRYPTION_FAILED", // Critical error
     DecryptionFailed = "DECRYPTION_FAILED", // Critical error
@@ -57,17 +58,13 @@ interface GenerateMfaSetupOutput {
 interface VerifyMfaSetupInput {
     token: string; // The 6-digit OTP code from the authenticator app
 }
+// disableMfa (No input needed besides auth context)
 
 // ============================================================================
 // === Generate MFA Setup Function ============================================
 // ============================================================================
 export const generateMfaSetup = functions.https.onCall(
-    {
-        region: FUNCTION_REGION,
-        memory: "256MiB",
-        timeoutSeconds: 30,
-        // secrets: ["ENCRYPTION_KEY"],
-    },
+    { region: FUNCTION_REGION, memory: "256MiB", timeoutSeconds: 30, /* secrets: ["ENCRYPTION_KEY"] */ },
     async (request): Promise<{ success: true; data: GenerateMfaSetupOutput } | { success: false; error: string; errorCode: string }> => {
         const functionName = "[generateMfaSetup V1]";
         const startTimeFunc = Date.now();
@@ -87,8 +84,6 @@ export const generateMfaSetup = functions.https.onCall(
             userRole = userData.role;
             userEmail = userData.email ?? userId;
             logContext.userRole = userRole;
-
-            // Permission check can be added here if needed
 
             if (userData.isMfaEnabled === true) { return { success: false, error: "error.mfa.alreadyEnabled", errorCode: ErrorCode.MfaAlreadyEnabled }; }
 
@@ -143,36 +138,25 @@ export const generateMfaSetup = functions.https.onCall(
 // === Verify MFA Setup Function ==============================================
 // ============================================================================
 export const verifyMfaSetup = functions.https.onCall(
-    {
-        region: FUNCTION_REGION,
-        memory: "256MiB", // Needs memory for decryption/verification
-        timeoutSeconds: 30,
-        // secrets: ["ENCRYPTION_KEY"], // Add secret for your encryption key
-    },
+    { region: FUNCTION_REGION, memory: "256MiB", timeoutSeconds: 30, /* secrets: ["ENCRYPTION_KEY"] */ },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
         const functionName = "[verifyMfaSetup V1]";
         const startTimeFunc = Date.now();
-
-        // 1. Authentication & Authorization
         if (!request.auth?.uid) { return { success: false, error: "error.auth.unauthenticated", errorCode: ErrorCode.Unauthenticated }; }
         const userId = request.auth.uid;
         const data = request.data as VerifyMfaSetupInput;
         const logContext: any = { userId };
         logger.info(`${functionName} Invoked.`, logContext);
 
-        // 2. Input Validation
         if (!data?.token || typeof data.token !== 'string' || !/^\d{6}$/.test(data.token)) {
-            logger.error(`${functionName} Invalid input: Missing or invalid OTP token.`, logContext);
             return { success: false, error: "error.invalidInput.mfaToken", errorCode: ErrorCode.InvalidArgument };
         }
         const { token } = data;
 
-        // --- Variables ---
         let userData: User;
         let encryptedPendingSecret: string | null;
 
         try {
-            // 3. Fetch User Data & Pending Secret
             const userRef = db.collection('users').doc(userId);
             const userSnap = await userRef.get();
             if (!userSnap.exists) { return { success: false, error: "error.user.notFound", errorCode: ErrorCode.UserNotFound }; }
@@ -180,70 +164,121 @@ export const verifyMfaSetup = functions.https.onCall(
             encryptedPendingSecret = userData.mfaPendingSecret ?? null;
             logContext.userRole = userData.role;
 
-            // Permission check can be added here if needed
-
             if (userData.isMfaEnabled === true) { return { success: false, error: "error.mfa.alreadyEnabled", errorCode: ErrorCode.MfaAlreadyEnabled }; }
             if (!encryptedPendingSecret) { return { success: false, error: "error.mfa.noPendingSecret", errorCode: ErrorCode.MissingPendingSecret }; }
 
-            // Optional: Check expiry of pending secret using mfaPendingTimestamp
-
-            // 4. CRITICAL: Decrypt the Pending Secret
-            logger.info(`${functionName} Decrypting pending secret for user ${userId}...`, logContext);
             let plainTextSecret: string;
             try {
-                // Replace mock with call to your actual KMS/decryption helper
-                plainTextSecret = await decryptSecret(encryptedPendingSecret);
-                if (!plainTextSecret) throw new Error("Decryption returned empty value.");
+                plainTextSecret = await decryptSecret(encryptedPendingSecret); // Replace mock
+                if (!plainTextSecret) throw new Error("Decryption returned empty");
             } catch (decError: any) {
-                logger.error(`${functionName} CRITICAL: Failed to decrypt pending MFA secret for user ${userId}. Aborting verification.`, { ...logContext, error: decError.message });
-                // Clear the pending secret? Or leave for retry? Let's clear it for security.
                 await userRef.update({ mfaPendingSecret: null, mfaPendingTimestamp: null }).catch();
                 return { success: false, error: "error.mfa.decryptionFailed", errorCode: ErrorCode.DecryptionFailed };
             }
 
-            // 5. Verify the OTP Token using Speakeasy
-            logger.info(`${functionName} Verifying provided token against decrypted secret...`, logContext);
             let isValidToken: boolean;
             try {
-                isValidToken = speakeasy.totp.verify({
-                    secret: plainTextSecret,
-                    encoding: 'base32',
-                    token: token,
-                    window: 1, // Allow 1 time step tolerance (e.g., +/- 30 seconds)
-                });
-            } catch (verifyError: any) {
-                 logger.error(`${functionName} Speakeasy verification failed.`, { ...logContext, error: verifyError.message });
-                 return { success: false, error: "error.mfa.otpVerificationFailed", errorCode: ErrorCode.OtpVerificationFailed };
-            }
+                isValidToken = speakeasy.totp.verify({ secret: plainTextSecret, encoding: 'base32', token: token, window: 1 });
+            } catch (verifyError: any) { return { success: false, error: "error.mfa.otpVerificationFailed", errorCode: ErrorCode.OtpVerificationFailed }; }
 
             if (!isValidToken) {
-                logger.warn(`${functionName} Invalid MFA token provided by user ${userId}.`, logContext);
                 logUserActivity("VerifyMfaSetupFailed", { reason: "Invalid token" }, userId).catch();
                 return { success: false, error: "error.mfa.invalidCode", errorCode: ErrorCode.InvalidOtpCode };
             }
 
-            // 6. Verification Successful - Update User Document
-            logger.info(`${functionName} MFA token verified successfully for user ${userId}. Enabling MFA...`, logContext);
             await userRef.update({
-                isMfaEnabled: true, // Enable MFA
-                mfaSecret: encryptedPendingSecret, // Move pending secret to the verified field
-                mfaPendingSecret: null, // Clear pending secret
+                isMfaEnabled: true,
+                mfaSecret: encryptedPendingSecret, // Move pending to verified
+                mfaPendingSecret: null,
                 mfaPendingTimestamp: null,
                 mfaEnabledTimestamp: FieldValue.serverTimestamp(),
                 updatedAt: FieldValue.serverTimestamp(),
             });
 
-            // 7. Log Success Activity (Async)
-            logUserActivity("VerifyMfaSetupSuccess", { success: true }, userId).catch(err => logger.error("Failed logging activity", { err }));
-
-            // 8. Return Success
+            logUserActivity("VerifyMfaSetupSuccess", { success: true }, userId).catch();
             logger.info(`${functionName} MFA enabled successfully for user ${userId}.`, logContext);
             return { success: true };
 
         } catch (error: any) {
+            logger.error(`${functionName} Unexpected error.`, { ...logContext, error: error.message });
+            logUserActivity("VerifyMfaSetupFailed", { success: false, error: error.message }, userId).catch();
+            const isHttpsError = error instanceof HttpsError;
+            let finalErrorCode: ErrorCode = ErrorCode.InternalError;
+            let finalErrorMessageKey: string = "error.internalServer";
+            if (isHttpsError) { finalErrorCode = (error.details as any)?.errorCode as ErrorCode || ErrorCode.InternalError; finalErrorMessageKey = error.message.startsWith("error.") ? error.message : `error.mfa.verifyGeneric`; }
+            return { success: false, error: finalErrorMessageKey, errorCode: finalErrorCode };
+        } finally {
+             logger.info(`${functionName} Execution finished. Duration: ${Date.now() - startTimeFunc}ms`, logContext);
+        }
+    }
+);
+
+
+// ============================================================================
+// === Disable MFA Function ===================================================
+// ============================================================================
+export const disableMfa = functions.https.onCall(
+    {
+        region: FUNCTION_REGION,
+        memory: "128MiB",
+        timeoutSeconds: 30,
+    },
+    async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
+        const functionName = "[disableMfa V1]";
+        const startTimeFunc = Date.now();
+
+        // 1. Authentication & Authorization
+        if (!request.auth?.uid) { return { success: false, error: "error.auth.unauthenticated", errorCode: ErrorCode.Unauthenticated }; }
+        const userId = request.auth.uid; // User disabling MFA for themselves
+        const logContext: any = { userId };
+        logger.info(`${functionName} Invoked.`, logContext);
+
+        // --- Variables ---
+        let userData: User;
+
+        try {
+            // 2. Fetch User Data
+            const userRef = db.collection('users').doc(userId);
+            const userSnap = await userRef.get();
+            if (!userSnap.exists) { return { success: false, error: "error.user.notFound", errorCode: ErrorCode.UserNotFound }; }
+            userData = userSnap.data() as User;
+            logContext.userRole = userData.role;
+
+            // Permission Check (Allow any logged-in user to disable their own MFA?)
+            // const hasPermission = await checkPermission(userId, userRole, 'mfa:disable:own');
+            // if (!hasPermission) { return { success: false, error: "error.permissionDenied.disableMfa", errorCode: ErrorCode.PermissionDenied }; }
+
+            // 3. State Validation
+            if (userData.isMfaEnabled !== true) {
+                logger.warn(`${functionName} MFA is not currently enabled for user ${userId}.`, logContext);
+                // Idempotency: If already disabled, return success
+                return { success: true };
+                // Or return error:
+                // return { success: false, error: "error.mfa.notEnabled", errorCode: ErrorCode.MfaNotEnabled };
+            }
+
+            // 4. Update User Document
+            logger.info(`${functionName} Disabling MFA for user ${userId}...`, logContext);
+            await userRef.update({
+                isMfaEnabled: false,
+                mfaSecret: null, // Remove the verified secret
+                mfaPendingSecret: null, // Also clear any pending secret
+                mfaPendingTimestamp: null,
+                mfaEnabledTimestamp: null, // Clear enabled timestamp
+                updatedAt: FieldValue.serverTimestamp(),
+            });
+
+            // 5. Log Success Activity (Async)
+            logUserActivity("DisableMfaSuccess", { success: true }, userId).catch(err => logger.error("Failed logging activity", { err }));
+
+            // 6. Return Success
+            logger.info(`${functionName} MFA disabled successfully for user ${userId}.`, logContext);
+            return { success: true };
+
+        } catch (error: any) {
             // Handle unexpected errors
-            logger.error(`${functionName} Unexpected error verifying MFA setup.`, { ...logContext, error: error.message });
-            logUserActivity("VerifyMfaSetupFailed", { success: false, error: error.message }, userId).catch(err => logger.error("Failed logging activity", { err }));
+            logger.error(`${functionName} Unexpected error disabling MFA.`, { ...logContext, error: error.message });
+            logUserActivity("DisableMfaFailed", { success: false, error: error.message }, userId).catch(err => logger.error("Failed logging activity", { err }));
 
             const isHttpsError = error instanceof HttpsError;
             let finalErrorCode: ErrorCode = ErrorCode.InternalError;
@@ -251,7 +286,7 @@ export const verifyMfaSetup = functions.https.onCall(
 
             if (isHttpsError) {
                 finalErrorCode = (error.details as any)?.errorCode as ErrorCode || ErrorCode.InternalError;
-                finalErrorMessageKey = error.message.startsWith("error.") ? error.message : `error.mfa.verifyGeneric`;
+                finalErrorMessageKey = error.message.startsWith("error.") ? error.message : `error.mfa.disableGeneric`;
                 if (!Object.values(ErrorCode).includes(finalErrorCode)) finalErrorCode = ErrorCode.InternalError;
             }
 
@@ -262,4 +297,4 @@ export const verifyMfaSetup = functions.https.onCall(
     }
 );
 
-// Add disableMfa and verifyMfaLogin later...
+// Add verifyMfaLogin later...

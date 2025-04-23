@@ -47,7 +47,7 @@ import { autoCancelExpiredOrders, deactivateExpiredPromotions, cleanupOldLogs } 
 // --- Import Auth Functions ---
 import { sendOtp } from './auth/sendOtp';
 import { verifyOtp } from './auth/verifyOtp';
-import { generateMfaSetup } from './auth/manageMfa'; // <-- שורה חדשה
+import { generateMfaSetup, verifyMfaSetup, disableMfa } from './auth/manageMfa'; // <-- עדכון שורה זו
 
 // --- Import Utility Functions (Helpers are usually not Cloud Functions themselves) ---
 import { logUserActivity } from './utils/logging';
@@ -88,7 +88,9 @@ export {
   // Auth
   sendOtp,
   verifyOtp,
-  generateMfaSetup, // <-- שורה חדשה
+  generateMfaSetup,
+  verifyMfaSetup,
+  disableMfa, // <-- שורה חדשה
   // ... export other callable functions ...
 };
 
