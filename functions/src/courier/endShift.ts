@@ -7,13 +7,12 @@ import { HttpsError } from "firebase-functions/v2/https";
 import { User, Box, Shift, ShiftStatus } from '../models'; // Adjust path if needed
 
 // --- Import Helpers ---
-import { checkPermission } from '../utils/permissions'; // <-- Import REAL helper
-// import { calculateExpectedCash } from '../utils/courier_calculations'; // Still using mock below
-// import { logUserActivity } from '../utils/logging'; // Still using mock below
+import { checkPermission } from '../utils/permissions';
+import { logUserActivity } from '../utils/logging'; // Using mock below
 
 // --- Mocks for other required helper functions (Replace with actual implementations) ---
 async function calculateExpectedCash(shiftId: string, startCash: number): Promise<number> { logger.info(`[Mock Calc] Calculating expected cash for shift ${shiftId} starting with ${startCash}`); const mockCashOrders = 5500; /* Simulate cash collected */ return startCash + mockCashOrders; }
-async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); }
+// async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); } // Imported
 // --- End Mocks ---
 
 // --- Configuration ---
@@ -54,7 +53,7 @@ export const endShift = functions.https.onCall(
         timeoutSeconds: 60,
     },
     async (request): Promise<{ success: true; cashDifference: number } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[endShift V2 - Permissions]"; // Updated version name
+        const functionName = "[endShift V2 - Permissions]";
         const startTimeFunc = Date.now();
 
         // 1. Authentication
@@ -87,11 +86,10 @@ export const endShift = functions.https.onCall(
             const courierSnapInitial = await courierRef.get();
             if (!courierSnapInitial.exists) throw new HttpsError('not-found', `error.user.notFound::${courierId}`, { errorCode: ErrorCode.UserNotFound });
             const courierDataInitial = courierSnapInitial.data() as User;
-            const courierRole = courierDataInitial.role; // Get role for permission check
+            const courierRole = courierDataInitial.role;
             logContext.courierRole = courierRole;
 
-            // 4. Permission Check (Using REAL helper)
-            // Define permission: 'courier:shift:end'
+            // 4. Permission Check
             const hasPermission = await checkPermission(courierId, courierRole, 'courier:shift:end', logContext);
             if (!hasPermission) {
                 const specificErrorCode = courierRole !== 'Courier' ? ErrorCode.NotCourier : ErrorCode.PermissionDenied;
@@ -100,7 +98,7 @@ export const endShift = functions.https.onCall(
                 return { success: false, error: errorMessage, errorCode: specificErrorCode };
             }
 
-            // 5. Validate Shift Status and Get IDs (after permission check)
+            // 5. Validate Shift Status and Get IDs
             if (courierDataInitial.shiftStatus !== ShiftStatus.OnDuty || !courierDataInitial.currentShiftId) {
                 logger.warn(`${functionName} Courier ${courierId} is not currently on shift.`, logContext);
                 return { success: false, error: "error.endShift.notOnShift", errorCode: ErrorCode.NotOnShift };
@@ -116,7 +114,7 @@ export const endShift = functions.https.onCall(
             shiftRef = db.collection('shifts').doc(shiftId);
             boxRef = db.collection('boxes').doc(boxId);
 
-            // 6. Calculate Expected Cash - Logic remains the same as V1
+            // 6. Calculate Expected Cash
             const shiftSnapInitial = await shiftRef.get();
             if (!shiftSnapInitial.exists) {
                  logger.error(`${functionName} Active shift document ${shiftId} not found for courier ${courierId}. Inconsistency detected.`, logContext);
@@ -132,7 +130,7 @@ export const endShift = functions.https.onCall(
             logContext.cashDifference = cashDifference;
             logger.info(`${functionName} Shift ${shiftId}: Start=${startCash}, End=${endCashSmallestUnit}, Expected=${expectedEndCash}, Diff=${cashDifference}`, logContext);
 
-            // 7. Firestore Transaction to Update All Documents - Logic remains the same as V1
+            // 7. Firestore Transaction to Update All Documents
             logger.info(`${functionName} Starting Firestore transaction...`, logContext);
             await db.runTransaction(async (transaction) => {
                 const [courierSnap, shiftSnap, boxSnap] = await Promise.all([
@@ -155,7 +153,7 @@ export const endShift = functions.https.onCall(
 
                 if (!boxSnap.exists) throw new Error(`TX_ERR::${ErrorCode.BoxNotFound}`);
                 const boxData = boxSnap.data() as Box;
-                let updateBox = false; // Flag to track if box needs update
+                let updateBox = false;
                 if (boxData.assignedCourierId === courierId) {
                      updateBox = true;
                 } else {
@@ -177,15 +175,15 @@ export const endShift = functions.https.onCall(
             });
             logger.info(`${functionName} Transaction successful. Shift ${shiftId} ended for courier ${courierId}. Cash difference: ${cashDifference}`, logContext);
 
-            // 8. Log User Activity (Async) - Logic remains the same as V1
+            // 8. Log User Activity (Async)
             logUserActivity("EndShift", { shiftId, endCash: endCashSmallestUnit, expectedCash: expectedEndCash, difference: cashDifference }, courierId)
-                .catch(err => logger.error("Failed logging user activity", { err }));
+                .catch(err => logger.error("Failed logging EndShift user activity", { err })); // Fixed catch
 
-            // 9. Return Success - Logic remains the same as V1
+            // 9. Return Success
             return { success: true, cashDifference: cashDifference };
 
         } catch (error: any) {
-            // Error Handling - Logic remains the same as V1
+            // Error Handling
             logger.error(`${functionName} Execution failed.`, { ...logContext, error: error?.message, details: error?.details });
             const isHttpsError = error instanceof HttpsError;
             let finalErrorCode: ErrorCode = ErrorCode.InternalError;
@@ -202,7 +200,8 @@ export const endShift = functions.https.onCall(
                 finalErrorMessageKey = error.message.startsWith("error.") ? error.message : `error.endShift.generic`;
             }
 
-            logUserActivity("EndShiftFailed", { shiftId: shiftId ?? 'Unknown', error: error.message }, courierId).catch(...)
+            logUserActivity("EndShiftFailed", { shiftId: shiftId ?? 'Unknown', error: error.message }, courierId)
+                .catch(err => logger.error("Failed logging EndShiftFailed user activity", { err })); // Fixed catch
 
             return { success: false, error: finalErrorMessageKey, errorCode: finalErrorCode };
         } finally {
