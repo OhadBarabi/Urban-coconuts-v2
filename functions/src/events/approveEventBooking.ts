@@ -11,9 +11,8 @@ import {
 
 // --- Import Helpers ---
 import { checkPermission } from '../utils/permissions';
-import { sendPushNotification } from '../utils/notifications'; // <-- Import REAL helper
-// import { calculateEventTotal } from '../utils/event_calculations'; // Using mock below
-// import { logAdminAction } from '../utils/logging'; // Using mock below
+import { sendPushNotification } from '../utils/notifications';
+import { logAdminAction } from '../utils/logging'; // Using mock below
 
 // --- Mocks for other required helper functions (Replace with actual implementations) ---
 interface EventTotalResult { totalAmount: number; error?: string; minOrderRequirementMet?: boolean; currencyCode?: string; }
@@ -25,7 +24,7 @@ function calculateEventTotal(items: SelectedEventItemInput[], menu?: Menu | null
     const currency = menu?.currencyCode ?? settings?.defaultCurrencyCode ?? 'ILS';
     return { totalAmount: total, minOrderRequirementMet: total >= minOrderValue, currencyCode: currency };
 }
-async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); }
+// async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); } // Imported
 // sendPushNotification is now imported from the helper
 // --- End Mocks ---
 
@@ -72,7 +71,7 @@ export const approveEventBooking = functions.https.onCall(
         timeoutSeconds: 60,
     },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[approveEventBooking V3 - Notifications]"; // Updated version name
+        const functionName = "[approveEventBooking V3 - Notifications]";
         const startTimeFunc = Date.now();
 
         // 1. Authentication & Authorization
@@ -146,7 +145,7 @@ export const approveEventBooking = functions.https.onCall(
                 return { success: false, error: `error.event.invalidStatus.approve::${bookingData.bookingStatus}`, errorCode: ErrorCode.InvalidBookingStatus };
             }
 
-            // 6. Handle 'ApprovedWithChanges' - Logic remains the same as V2
+            // 6. Handle 'ApprovedWithChanges'
             if (approvalStatus === "ApprovedWithChanges") {
                 if (!finalSelectedItems) {
                      throw new HttpsError('invalid-argument', "updatedItems are required for 'ApprovedWithChanges'.");
@@ -181,7 +180,7 @@ export const approveEventBooking = functions.https.onCall(
                  }
             }
 
-            // 7. Determine New Booking Status and Prepare Update Data - Logic remains the same as V2
+            // 7. Determine New Booking Status and Prepare Update Data
             const now = Timestamp.now();
             let newStatus: EventBookingStatus;
             let updateData: { [key: string]: any } = {
@@ -207,7 +206,7 @@ export const approveEventBooking = functions.https.onCall(
                 reason: `Admin ${approvalStatus}${adminNotes ? `: ${adminNotes}` : ''}`
             });
 
-            // 8. Update Booking Document in Firestore - Logic remains the same as V2
+            // 8. Update Booking Document in Firestore
             logger.info(`${functionName} Updating event booking ${bookingId} status to ${newStatus}...`, logContext);
             await bookingRef.update(updateData);
             logger.info(`${functionName} Booking ${bookingId} updated successfully.`, logContext);
@@ -225,30 +224,29 @@ export const approveEventBooking = functions.https.onCall(
                  titleKey = "notification.eventRejected.title";
                  messageKey = "notification.eventRejected.message";
             }
-            // Call the imported helper function
             sendPushNotification({
-                 userId: bookingData.customerId, // Target the customer
+                 userId: bookingData.customerId,
                  type: notificationType,
                  titleKey: titleKey,
                  messageKey: messageKey,
                  messageParams: { bookingId: bookingId, adminNotes: adminNotes ?? "" },
                  payload: { bookingId: bookingId, screen: 'eventDetails' }
-            }).catch(err => logger.error("Failed sending customer notification", { err }));
+            }).catch(err => logger.error("Failed sending customer notification", { err })); // Fixed catch
 
 
-            // 10. Log Admin Action (Async) - Logic remains the same as V2
+            // 10. Log Admin Action (Async)
             logAdminAction("ApproveEventBooking", {
                 bookingId, customerId: bookingData.customerId, decision: approvalStatus,
                 notes: adminNotes, updatedItems: approvalStatus === "ApprovedWithChanges" ? updatedItems : null,
                 updatedTotal: approvalStatus === "ApprovedWithChanges" ? finalTotalAmount : null,
                 triggerUserId: adminUserId, triggerUserRole: adminUserRole
-            }).catch(err => logger.error("Failed logging admin action", { err }));
+            }).catch(err => logger.error("Failed logging ApproveEventBooking admin action", { err })); // Fixed catch
 
-            // 11. Return Success - Logic remains the same as V2
+            // 11. Return Success
             return { success: true };
 
         } catch (error: any) {
-            // Error Handling - Logic remains the same as V2
+            // Error Handling
             logger.error(`${functionName} Execution failed.`, { ...logContext, error: error?.message, details: error?.details });
             const isHttpsError = error instanceof HttpsError;
             let finalErrorCode: ErrorCode = ErrorCode.InternalError;
@@ -261,7 +259,8 @@ export const approveEventBooking = functions.https.onCall(
                  if (error.message.includes("::")) { finalErrorMessageKey = error.message; }
             }
 
-            logAdminAction("ApproveEventBookingFailed", { bookingId, approvalStatus, error: error.message, triggerUserId: adminUserId }).catch(...)
+            logAdminAction("ApproveEventBookingFailed", { bookingId, approvalStatus, error: error.message, triggerUserId: adminUserId })
+                .catch(err => logger.error("Failed logging ApproveEventBookingFailed admin action", { err })); // Fixed catch
 
             return { success: false, error: finalErrorMessageKey, errorCode: finalErrorCode };
         } finally {
