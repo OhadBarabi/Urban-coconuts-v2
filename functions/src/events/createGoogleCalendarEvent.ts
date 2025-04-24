@@ -6,115 +6,20 @@ import * as admin from "firebase-admin";
 import { EventBooking, EventBookingStatus } from '../models'; // Adjust path if needed
 
 // --- Import Helpers ---
-import { createGoogleCalendarEvent as createEventInGCal } from '../utils/google_calendar_helpers'; // <-- Import REAL helper
-// import { logSystemActivity } from '../utils/logging'; // Using mock below
+import { createGoogleCalendarEvent as createEventInGCal } from '../utils/google_calendar_helpers';
+import { logSystemActivity } from '../utils/logging'; // Using mock below
 
 // --- Mocks ---
-async function logSystemActivity(actionType: string, details: object): Promise<void> { logger.info(`[Mock System Log] Action: ${actionType}`, details); }
+// async function logSystemActivity(actionType: string, details: object): Promise<void> { logger.info(`[Mock System Log] Action: ${actionType}`, details); } // Imported
 // --- End Mocks ---
 
 // --- Configuration ---
 const db = admin.firestore();
+const { FieldValue } = admin.firestore;
 const FUNCTION_REGION = "me-west1"; // <<<--- CHANGE TO YOUR REGION
-// Choose ONE trigger type: Firestore or Pub/Sub
-
-// Option 1: Firestore Trigger (Simpler, but less robust for external API calls)
-// Triggered when an event booking's status changes, specifically looking for transition to 'Confirmed'.
-/*
-export const createGoogleCalendarEvent = functions.firestore
-    .document('eventBookings/{bookingId}')
-    .region(FUNCTION_REGION)
-    .onUpdate(async (change, context): Promise<void> => {
-        const functionName = "[createGoogleCalendarEvent - Firestore Trigger V2]";
-        const bookingId = context.params.bookingId;
-        const beforeData = change.before.data() as EventBooking | undefined;
-        const afterData = change.after.data() as EventBooking | undefined;
-        const logContext = { functionName, trigger: "Firestore", bookingId };
-
-        if (!afterData) {
-            logger.info(`${functionName} Booking ${bookingId} deleted. No action needed.`, logContext);
-            return;
-        }
-
-        const beforeStatus = beforeData?.bookingStatus;
-        const afterStatus = afterData.bookingStatus;
-        logContext.beforeStatus = beforeStatus;
-        logContext.afterStatus = afterStatus;
-
-        // --- Trigger Condition ---
-        // Create event only when status becomes 'Confirmed' (or maybe 'Scheduled' depending on flow)
-        // and it wasn't already 'Confirmed'/'Scheduled' before.
-        const targetStatus = EventBookingStatus.Confirmed; // Or Scheduled?
-        if (afterStatus !== targetStatus || beforeStatus === targetStatus) {
-             logger.debug(`${functionName} Status did not transition to ${targetStatus}. No action needed.`, logContext);
-             return;
-        }
-         // Check if event already created to prevent duplicates
-         if (afterData.googleCalendarEventId) {
-             logger.warn(`${functionName} Booking ${bookingId} already has a Google Calendar Event ID (${afterData.googleCalendarEventId}). Skipping creation.`, logContext);
-             return;
-         }
-
-        logger.info(`${functionName} Processing confirmed booking ${bookingId} to create GCal event...`, logContext);
-
-        try {
-            // --- Prepare Event Data ---
-            const eventInput = {
-                summary: `Event Booking: ${bookingId}`, // Customize summary
-                description: `Customer: ${afterData.customerId}\nNotes: ${afterData.notes || 'N/A'}\nStatus: ${afterData.bookingStatus}`, // Customize description
-                startTime: afterData.startTime,
-                endTime: afterData.endTime,
-                location: afterData.location?.address || undefined, // Use address string if available
-                // attendees: [afterData.customerEmail], // Add customer email if available and desired
-                bookingId: bookingId, // Pass bookingId for reference
-                // timeZone: 'Asia/Jerusalem', // Handled by helper default
-            };
-
-            // --- Call Helper to Create Event ---
-            const result = await createEventInGCal(eventInput);
-
-            // --- Update Booking with Event ID or Error ---
-            const bookingRef = db.collection('eventBookings').doc(bookingId);
-            if (result.success && result.eventId) {
-                logger.info(`${functionName} GCal event created (${result.eventId}). Updating booking ${bookingId}.`, logContext);
-                await bookingRef.update({
-                    googleCalendarEventId: result.eventId,
-                    needsManualGcalCheck: false, // Clear flag if previously set
-                    updatedAt: FieldValue.serverTimestamp(),
-                });
-            } else {
-                logger.error(`${functionName} Failed to create GCal event for booking ${bookingId}. Updating booking with error flag.`, { ...logContext, error: result.error });
-                await bookingRef.update({
-                    googleCalendarEventId: null, // Ensure it's null
-                    needsManualGcalCheck: true, // Flag for manual intervention
-                    processingError: `GCal Create Failed: ${result.error || result.errorCode || 'Unknown'}`,
-                    updatedAt: FieldValue.serverTimestamp(),
-                });
-            }
-             // Log system activity
-             logSystemActivity("CreateGCalEventAttempt", { bookingId, success: result.success, eventId: result.eventId, error: result.error }).catch(...)
-
-
-        } catch (error: any) {
-            logger.error(`${functionName} Unhandled error processing booking ${bookingId}.`, { ...logContext, error: error.message, stack: error.stack });
-            // Attempt to mark booking with error flag
-             try {
-                 await db.collection('eventBookings').doc(bookingId).update({
-                     needsManualGcalCheck: true,
-                     processingError: `Fatal GCal Create Error: ${error?.message ?? 'Unknown'}`,
-                     updatedAt: FieldValue.serverTimestamp(),
-                 });
-             } catch (updateError) {
-                  logger.error(`${functionName} Failed to update booking ${bookingId} with fatal error info.`, { ...logContext, updateError });
-             }
-        }
-    });
-*/
-
-// Option 2: Pub/Sub Trigger (More Robust for external APIs)
-// Assumes another function (e.g., confirmEventAgreement) publishes the bookingId to this topic.
 const EVENT_CALENDAR_TOPIC = "create-google-calendar-event"; // Example topic name
 
+// --- The Background Function (Triggered by Pub/Sub) ---
 export const createGoogleCalendarEvent = functions.pubsub.topic(EVENT_CALENDAR_TOPIC)
     .region(FUNCTION_REGION)
     .onPublish(async (message): Promise<void> => {
@@ -134,7 +39,7 @@ export const createGoogleCalendarEvent = functions.pubsub.topic(EVENT_CALENDAR_T
                 logger.info(`${functionName} Received request to create GCal event.`, logContext);
             } catch (e: any) {
                 logger.error(`${functionName} Failed to parse Pub/Sub message.`, { error: e.message, data: message.data ? Buffer.from(message.data, 'base64').toString() : null });
-                return; // Acknowledge invalid message
+                return;
             }
 
             // 2. Fetch Event Booking Data
@@ -143,32 +48,29 @@ export const createGoogleCalendarEvent = functions.pubsub.topic(EVENT_CALENDAR_T
 
             if (!bookingSnap.exists) {
                 logger.error(`${functionName} Event booking ${bookingId} not found.`, logContext);
-                return; // Acknowledge - cannot process
+                return;
             }
             const bookingData = bookingSnap.data() as EventBooking;
             logContext.currentStatus = bookingData.bookingStatus;
 
-            // 3. State Validation (Optional but recommended)
-            // Ensure the booking is in a state where calendar creation makes sense
-            const validStatuses = [EventBookingStatus.Confirmed, EventBookingStatus.Scheduled]; // Add others if needed
+            // 3. State Validation
+            const validStatuses = [EventBookingStatus.Confirmed, EventBookingStatus.Scheduled];
             if (!validStatuses.includes(bookingData.bookingStatus)) {
                  logger.warn(`${functionName} Booking ${bookingId} is not in a valid status for GCal creation (current: ${bookingData.bookingStatus}). Skipping.`, logContext);
-                 return; // Acknowledge - wrong state
+                 return;
             }
-            // Prevent duplicate creation
             if (bookingData.googleCalendarEventId) {
                 logger.warn(`${functionName} Booking ${bookingId} already has a Google Calendar Event ID (${bookingData.googleCalendarEventId}). Skipping creation.`, logContext);
-                return; // Acknowledge - already done
+                return;
             }
 
             // 4. Prepare Event Data
              const eventInput = {
-                 summary: `Event: ${bookingData.eventMenuId || 'Custom'} - ${bookingId.substring(0,6)}`, // Example summary
+                 summary: `Event: ${bookingData.eventMenuId || 'Custom'} - ${bookingId.substring(0,6)}`,
                  description: `Customer: ${bookingData.customerId}\nBooking ID: ${bookingId}\nNotes: ${bookingData.notes || 'N/A'}\nStatus: ${bookingData.bookingStatus}`,
                  startTime: bookingData.startTime,
                  endTime: bookingData.endTime,
                  location: bookingData.location?.address || undefined,
-                 // attendees: [customerEmail], // Fetch customer email if needed
                  bookingId: bookingId,
              };
 
@@ -194,12 +96,12 @@ export const createGoogleCalendarEvent = functions.pubsub.topic(EVENT_CALENDAR_T
                 });
             }
              // Log system activity
-             logSystemActivity("CreateGCalEventAttempt", { bookingId, success: result.success, eventId: result.eventId, error: result.error }).catch(...)
+             logSystemActivity("CreateGCalEventAttempt", { bookingId, success: result.success, eventId: result.eventId, error: result.error })
+                .catch(err => logger.error("Failed logging CreateGCalEventAttempt system activity", { err })); // Fixed catch
 
 
         } catch (error: any) {
             logger.error(`${functionName} Unhandled error processing booking ${bookingId}.`, { ...logContext, error: error.message, stack: error.stack });
-             // Attempt to mark booking with error flag
               if (bookingId) {
                   try {
                       await db.collection('eventBookings').doc(bookingId).update({

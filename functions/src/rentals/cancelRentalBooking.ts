@@ -9,13 +9,13 @@ import {
 } from '../models'; // Adjust path if needed
 
 // --- Import Helpers ---
-import { checkPermission } from '../utils/permissions'; // <-- Import REAL helper
+import { checkPermission } from '../utils/permissions';
 import { voidAuthorization } from '../utils/payment_helpers';
-// import { logUserActivity, logAdminAction } from '../utils/logging'; // Still using mock below
+import { logUserActivity, logAdminAction } from '../utils/logging'; // Using mock below
 
 // --- Mocks for other required helper functions (Replace with actual implementations) ---
-async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); }
-async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); }
+// async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); } // Imported
+// async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); } // Imported
 // --- End Mocks ---
 
 // --- Configuration ---
@@ -57,12 +57,12 @@ export const cancelRentalBooking = functions.https.onCall(
         // secrets: ["PAYMENT_GATEWAY_SECRET"], // Uncomment if payment helper needs secrets
     },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[cancelRentalBooking V3 - Permissions]"; // Updated version name
+        const functionName = "[cancelRentalBooking V3 - Permissions]";
         const startTimeFunc = Date.now();
 
         // 1. Authentication & Authorization
         if (!request.auth?.uid) { return { success: false, error: "error.auth.unauthenticated", errorCode: ErrorCode.Unauthenticated }; }
-        const userId = request.auth.uid; // User initiating cancellation (Customer or Admin)
+        const userId = request.auth.uid;
         const data = request.data as CancelRentalBookingInput;
         const logContext: any = { userId, bookingId: data?.bookingId, reason: data?.reason };
 
@@ -80,25 +80,23 @@ export const cancelRentalBooking = functions.https.onCall(
         // --- Variables ---
         let bookingData: RentalBooking;
         let userData: User;
-        let userRole: string | null; // Fetch role
+        let userRole: string | null;
         let voidResult: Awaited<ReturnType<typeof voidAuthorization>> | null = null;
         let updatedPaymentStatus: PaymentStatus;
 
         // --- Firestore References ---
         const bookingRef = db.collection('rentalBookings').doc(bookingId);
-        const userRef = db.collection('users').doc(userId); // Needed for role check
+        const userRef = db.collection('users').doc(userId);
 
         try {
             // 3. Fetch User and Booking Data Concurrently
             const [userSnap, bookingSnap] = await Promise.all([userRef.get(), bookingRef.get()]);
 
-            // Validate User
             if (!userSnap.exists) throw new HttpsError('not-found', `error.user.notFound::${userId}`, { errorCode: ErrorCode.UserNotFound });
             userData = userSnap.data() as User;
-            userRole = userData.role; // Get role
+            userRole = userData.role;
             logContext.userRole = userRole;
 
-            // Validate Booking
             if (!bookingSnap.exists) {
                 logger.warn(`${functionName} Rental booking ${bookingId} not found.`, logContext);
                 return { success: false, error: "error.rental.bookingNotFound", errorCode: ErrorCode.BookingNotFound };
@@ -110,11 +108,10 @@ export const cancelRentalBooking = functions.https.onCall(
             logContext.pickupBoxId = bookingData.pickupBoxId;
             logContext.rentalItemId = bookingData.rentalItemId;
 
-            // 4. Permission Check (Using REAL helper)
+            // 4. Permission Check
             const isOwner = userId === bookingData.customerId;
             const isAdmin = userRole === 'Admin' || userRole === 'SuperAdmin';
             const requiredPermission = isOwner ? 'rental:cancel:own' : (isAdmin ? 'rental:cancel:any' : 'permission_denied');
-            // Pass fetched role to checkPermission
             const hasPermission = await checkPermission(userId, userRole, requiredPermission, logContext);
 
             if (!hasPermission) {
@@ -123,20 +120,19 @@ export const cancelRentalBooking = functions.https.onCall(
                 return { success: false, error: "error.permissionDenied.cancelRental", errorCode: errorCode };
             }
 
-            // 5. State Validation - Logic remains the same as V2
+            // 5. State Validation
             const cancellableStatuses: string[] = [RentalBookingStatus.PendingPickup.toString()];
             if (!cancellableStatuses.includes(bookingData.bookingStatus)) {
                 logger.warn(`${functionName} Rental booking ${bookingId} cannot be cancelled from status '${bookingData.bookingStatus}'.`, logContext);
                 return { success: false, error: `error.rental.invalidStatus.cancel::${bookingData.bookingStatus}`, errorCode: ErrorCode.InvalidBookingStatus };
-            }
+             }
              if (bookingData.bookingStatus === RentalBookingStatus.Cancelled) {
                   logger.warn(`${functionName} Rental booking ${bookingId} is already cancelled.`, logContext);
                   return { success: false, error: "error.rental.alreadyCancelled", errorCode: ErrorCode.FailedPrecondition };
              }
 
-            // 6. Handle Payment Void (if applicable) - Logic remains the same as V2
+            // 6. Handle Payment Void
             updatedPaymentStatus = bookingData.paymentStatus;
-
             if (bookingData.paymentStatus === PaymentStatus.Authorized) {
                 const authId = bookingData.paymentDetails?.authorizationId;
                 if (!authId) {
@@ -145,20 +141,15 @@ export const cancelRentalBooking = functions.https.onCall(
                 logger.info(`${functionName} Booking ${bookingId}: Deposit is Authorized. Attempting to void authorization ${authId}...`, logContext);
                 voidResult = await voidAuthorization(authId);
                 updatedPaymentStatus = voidResult.success ? PaymentStatus.Voided : PaymentStatus.VoidFailed;
-                if (!voidResult.success) {
-                    logger.error(`${functionName} Deposit void failed for booking ${bookingId}, AuthID: ${authId}.`, { ...logContext, error: voidResult.errorMessage, code: voidResult.errorCode });
-                } else {
-                    logger.info(`${functionName} Deposit void successful for booking ${bookingId}, AuthID: ${authId}.`, logContext);
-                }
+                if (!voidResult.success) logger.error(`${functionName} Deposit void failed.`, { ...logContext, error: voidResult.errorMessage });
+                else logger.info(`${functionName} Deposit void successful.`, logContext);
             } else if (bookingData.paymentStatus === PaymentStatus.Captured || bookingData.paymentStatus === PaymentStatus.Paid) {
-                logger.warn(`${functionName} Booking ${bookingId}: Deposit payment status is ${bookingData.paymentStatus}. Cancellation does not automatically trigger refund at this stage.`, logContext);
-            } else {
-                logger.info(`${functionName} Booking ${bookingId}: No payment action required for cancellation based on current payment status '${bookingData.paymentStatus}'.`, logContext);
+                logger.warn(`${functionName} Booking ${bookingId}: Deposit payment status is ${bookingData.paymentStatus}. Cancellation does not automatically trigger refund.`, logContext);
             }
             logContext.updatedPaymentStatus = updatedPaymentStatus;
 
-            // 7. Firestore Transaction to Update Booking Status and Restore Inventory - Logic remains the same as V2
-            logger.info(`${functionName} Starting Firestore transaction to update booking status and inventory...`, logContext);
+            // 7. Firestore Transaction to Update Booking Status and Restore Inventory
+            logger.info(`${functionName} Starting Firestore transaction...`, logContext);
             const boxRef = db.collection('boxes').doc(bookingData.pickupBoxId);
 
             await db.runTransaction(async (transaction) => {
@@ -176,28 +167,21 @@ export const cancelRentalBooking = functions.https.onCall(
                     return;
                 }
                 if (!cancellableStatuses.includes(bookingTxData.bookingStatus)) {
-                     logger.warn(`${functionName} TX Conflict: Booking ${bookingId} status changed to ${bookingTxData.bookingStatus} during TX. Aborting cancellation.`);
+                     logger.warn(`${functionName} TX Conflict: Booking ${bookingId} status changed. Aborting cancellation.`);
                      return;
                 }
 
                 const now = Timestamp.now();
                 const updateData: { [key: string]: any } = {
-                    bookingStatus: RentalBookingStatus.Cancelled,
-                    paymentStatus: updatedPaymentStatus,
-                    updatedAt: FieldValue.serverTimestamp(),
-                    cancellationTimestamp: now,
-                    cancelledBy: userId,
-                    cancellationReason: reason || null,
-                    processingError: null,
+                    bookingStatus: RentalBookingStatus.Cancelled, paymentStatus: updatedPaymentStatus,
+                    updatedAt: FieldValue.serverTimestamp(), cancellationTimestamp: now, cancelledBy: userId,
+                    cancellationReason: reason || null, processingError: null,
                 };
                  if (voidResult && !voidResult.success) {
                      updateData['paymentDetails.voidErrorCode'] = voidResult.errorCode;
                      updateData['paymentDetails.voidErrorMessage'] = voidResult.errorMessage;
                  }
-
-                const inventoryUpdate = {
-                    [`rentalInventory.${bookingData.rentalItemId}`]: FieldValue.increment(1)
-                };
+                const inventoryUpdate = { [`rentalInventory.${bookingData.rentalItemId}`]: FieldValue.increment(1) };
 
                 transaction.update(bookingRef, updateData);
                 transaction.update(boxRef, inventoryUpdate);
@@ -205,19 +189,21 @@ export const cancelRentalBooking = functions.https.onCall(
             });
             logger.info(`${functionName} Transaction successful. Rental booking ${bookingId} cancelled and inventory restored.`, logContext);
 
-            // 8. Log Action (Async) - Logic remains the same as V2
+            // 8. Log Action (Async)
             const logDetails = { bookingId, customerId: bookingData.customerId, cancelledBy: userId, userRole, reason, initialStatus: bookingData.bookingStatus, finalPaymentStatus: updatedPaymentStatus };
             if (isAdmin) {
-                logAdminAction("CancelRentalBooking", logDetails).catch(err => logger.error("Failed logging admin action", { err }));
+                logAdminAction("CancelRentalBooking", logDetails)
+                    .catch(err => logger.error("Failed logging CancelRentalBooking admin action", { err })); // Fixed catch
             } else {
-                logUserActivity("CancelRentalBooking", logDetails, userId).catch(err => logger.error("Failed logging user activity", { err }));
+                logUserActivity("CancelRentalBooking", logDetails, userId)
+                    .catch(err => logger.error("Failed logging CancelRentalBooking user activity", { err })); // Fixed catch
             }
 
-            // 9. Return Success - Logic remains the same as V2
+            // 9. Return Success
             return { success: true };
 
         } catch (error: any) {
-            // Error Handling - Logic remains the same as V2
+            // Error Handling
             logger.error(`${functionName} Execution failed.`, { ...logContext, error: error?.message, details: error?.details });
             const isHttpsError = error instanceof HttpsError;
             let finalErrorCode: ErrorCode = ErrorCode.InternalError;
@@ -236,7 +222,8 @@ export const cancelRentalBooking = functions.https.onCall(
                  if (parts[2]) finalErrorMessageKey += `::${parts[2]}`;
             }
 
-            logUserActivity("CancelRentalBookingFailed", { bookingId, reason, error: error.message }, userId).catch(...)
+            logUserActivity("CancelRentalBookingFailed", { bookingId, reason, error: error.message }, userId)
+                .catch(err => logger.error("Failed logging CancelRentalBookingFailed user activity", { err })); // Fixed catch
 
             return { success: false, error: finalErrorMessageKey, errorCode: finalErrorCode };
         } finally {

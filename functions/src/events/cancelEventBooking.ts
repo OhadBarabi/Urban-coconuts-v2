@@ -11,12 +11,12 @@ import {
 // --- Import Helpers ---
 import { checkPermission } from '../utils/permissions';
 import { voidAuthorization, processRefund, extractPaymentDetailsFromResult } from '../utils/payment_helpers';
-import { deleteGoogleCalendarEvent } from '../utils/google_calendar_helpers'; // <-- Import REAL helper
-// import { logUserActivity, logAdminAction } from '../utils/logging'; // Using mocks below
+import { deleteGoogleCalendarEvent } from '../utils/google_calendar_helpers';
+import { logUserActivity, logAdminAction } from '../utils/logging'; // Using mocks below
 
 // --- Mocks for other required helper functions (Replace with actual implementations) ---
-async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); }
-async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); }
+// async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); } // Imported
+// async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); } // Imported
 // deleteGoogleCalendarEvent is now imported from the helper
 // --- End Mocks ---
 
@@ -61,12 +61,12 @@ export const cancelEventBooking = functions.https.onCall(
         // secrets: ["PAYMENT_GATEWAY_SECRET", "GOOGLE_API_CREDENTIALS"], // Example secrets
     },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[cancelEventBooking V3 - GCal Helper]"; // Updated version name
+        const functionName = "[cancelEventBooking V3 - GCal Helper]";
         const startTimeFunc = Date.now();
 
         // 1. Authentication & Authorization
         if (!request.auth?.uid) { return { success: false, error: "error.auth.unauthenticated", errorCode: ErrorCode.Unauthenticated }; }
-        const userId = request.auth.uid; // User initiating cancellation (Customer or Admin)
+        const userId = request.auth.uid;
         const data = request.data as CancelEventBookingInput;
         const logContext: any = { userId, bookingId: data?.bookingId, reason: data?.reason };
 
@@ -89,7 +89,7 @@ export const cancelEventBooking = functions.https.onCall(
         let refundResult: Awaited<ReturnType<typeof processRefund>> | null = null;
         let updatedPaymentStatus: PaymentStatus;
         let refundDetails: RefundDetails | null = null;
-        let gcalDeleteSuccess = true; // Assume success unless GCal interaction fails
+        let gcalDeleteSuccess = true;
 
         // --- Firestore References ---
         const bookingRef = db.collection('eventBookings').doc(bookingId);
@@ -99,13 +99,11 @@ export const cancelEventBooking = functions.https.onCall(
             // 3. Fetch User and Booking Data Concurrently
             const [userSnap, bookingSnap] = await Promise.all([userRef.get(), bookingRef.get()]);
 
-            // Validate User
             if (!userSnap.exists) throw new HttpsError('not-found', `error.user.notFound::${userId}`, { errorCode: ErrorCode.UserNotFound });
             userData = userSnap.data() as User;
             userRole = userData.role;
             logContext.userRole = userRole;
 
-            // Validate Booking
             if (!bookingSnap.exists) {
                 logger.warn(`${functionName} Event booking ${bookingId} not found.`, logContext);
                 return { success: false, error: "error.event.bookingNotFound", errorCode: ErrorCode.BookingNotFound };
@@ -143,7 +141,7 @@ export const cancelEventBooking = functions.https.onCall(
                   return { success: false, error: "error.event.alreadyCancelled", errorCode: ErrorCode.FailedPrecondition };
              }
 
-            // 6. Handle Payment Void/Refund (if applicable) - Logic remains the same as V2
+            // 6. Handle Payment Void/Refund
             updatedPaymentStatus = bookingData.paymentStatus;
             if (bookingData.paymentStatus === PaymentStatus.Paid || bookingData.paymentStatus === PaymentStatus.Captured) {
                  const transactionId = bookingData.paymentDetails?.transactionId;
@@ -176,14 +174,13 @@ export const cancelEventBooking = functions.https.onCall(
             }
             logContext.updatedPaymentStatus = updatedPaymentStatus;
 
-            // 7. Delete Google Calendar Event (Using REAL Helper)
+            // 7. Delete Google Calendar Event
             if (bookingData.googleCalendarEventId) {
                  logger.info(`${functionName} Attempting to delete Google Calendar event: ${bookingData.googleCalendarEventId}`, logContext);
-                 // Call the helper function
                  const gcalResult = await deleteGoogleCalendarEvent(bookingData.googleCalendarEventId);
                  if (!gcalResult.success) {
                       logger.error(`${functionName} Failed to delete Google Calendar event ${bookingData.googleCalendarEventId}.`, { ...logContext, error: gcalResult.error });
-                      gcalDeleteSuccess = false; // Mark failure but continue cancellation
+                      gcalDeleteSuccess = false;
                  } else {
                       logger.info(`${functionName} Google Calendar event ${bookingData.googleCalendarEventId} deleted successfully.`, logContext);
                  }
@@ -191,7 +188,7 @@ export const cancelEventBooking = functions.https.onCall(
                 logger.info(`${functionName} No Google Calendar event ID found for booking ${bookingId}. Skipping deletion.`, logContext);
             }
 
-            // 8. Firestore Transaction to Update Booking Status - Logic remains the same as V2
+            // 8. Firestore Transaction to Update Booking Status
             logger.info(`${functionName} Starting Firestore transaction to update booking status...`, logContext);
             await db.runTransaction(async (transaction) => {
                 const bookingTxSnap = await transaction.get(bookingRef);
@@ -220,8 +217,8 @@ export const cancelEventBooking = functions.https.onCall(
                         reason: `Cancelled by ${userRole ?? 'User'}${reason ? `: ${reason}` : ''}`
                     }),
                     processingError: null,
-                    needsManualGcalDelete: !gcalDeleteSuccess, // Flag if GCal delete failed
-                    googleCalendarEventId: gcalDeleteSuccess ? null : bookingData.googleCalendarEventId, // Clear GCal ID only if deletion succeeded
+                    needsManualGcalDelete: !gcalDeleteSuccess,
+                    googleCalendarEventId: gcalDeleteSuccess ? null : bookingData.googleCalendarEventId,
                 };
                 if (refundDetails) updateData.refundDetails = refundDetails;
                 if (voidResult && !voidResult.success) {
@@ -236,19 +233,21 @@ export const cancelEventBooking = functions.https.onCall(
             });
             logger.info(`${functionName} Event booking ${bookingId} status updated to Cancelled successfully.`, logContext);
 
-            // 9. Log Action (Async) - Logic remains the same as V2
+            // 9. Log Action (Async)
             const logDetails = { bookingId, customerId: bookingData.customerId, cancelledBy: userId, userRole, reason, initialStatus: bookingData.bookingStatus, finalPaymentStatus: updatedPaymentStatus, gcalDeleteSuccess };
             if (isAdmin) {
-                logAdminAction("CancelEventBooking", logDetails).catch(err => logger.error("Failed logging admin action", { err }));
+                logAdminAction("CancelEventBooking", logDetails)
+                    .catch(err => logger.error("Failed logging CancelEventBooking admin action", { err })); // Fixed catch
             } else {
-                logUserActivity("CancelEventBooking", logDetails, userId).catch(err => logger.error("Failed logging user activity", { err }));
+                logUserActivity("CancelEventBooking", logDetails, userId)
+                    .catch(err => logger.error("Failed logging CancelEventBooking user activity", { err })); // Fixed catch
             }
 
-            // 10. Return Success - Logic remains the same as V2
+            // 10. Return Success
             return { success: true };
 
         } catch (error: any) {
-            // Error Handling - Logic remains the same as V2
+            // Error Handling
             logger.error(`${functionName} Execution failed.`, { ...logContext, error: error?.message, details: error?.details });
             const isHttpsError = error instanceof HttpsError;
             let finalErrorCode: ErrorCode = ErrorCode.InternalError;
@@ -267,7 +266,8 @@ export const cancelEventBooking = functions.https.onCall(
                  if (parts[2]) finalErrorMessageKey += `::${parts[2]}`;
             }
 
-            logUserActivity("CancelEventBookingFailed", { bookingId, reason, error: error.message }, userId).catch(...)
+            logUserActivity("CancelEventBookingFailed", { bookingId, reason, error: error.message }, userId)
+                .catch(err => logger.error("Failed logging CancelEventBookingFailed user activity", { err })); // Fixed catch
 
             return { success: false, error: finalErrorMessageKey, errorCode: finalErrorCode };
         } finally {

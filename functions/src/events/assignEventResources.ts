@@ -7,11 +7,11 @@ import { HttpsError } from "firebase-functions/v2/https";
 import { User, EventBooking, EventBookingStatus, EventResource } from '../models'; // Adjust path if needed
 
 // --- Import Helpers ---
-import { checkPermission } from '../utils/permissions'; // <-- Import REAL helper
-// import { logAdminAction } from '../utils/logging'; // Using mock below
+import { checkPermission } from '../utils/permissions';
+import { logAdminAction } from '../utils/logging'; // Using mock below
 
 // --- Mocks for other required helper functions (Replace with actual implementations) ---
-async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); }
+// async function logAdminAction(action: string, details: object): Promise<void> { logger.info(`[Mock Admin Log] Action: ${action}`, details); } // Imported
 // --- End Mocks ---
 
 // --- Configuration ---
@@ -29,10 +29,11 @@ enum ErrorCode {
     InternalError = "INTERNAL_ERROR",
     // Specific codes
     BookingNotFound = "BOOKING_NOT_FOUND",
-    UserNotFound = "USER_NOT_FOUND", // Admin user not found
+    UserNotFound = "USER_NOT_FOUND", // Admin user or Lead Courier not found
     ResourceNotFound = "RESOURCE_NOT_FOUND", // Assigned resource ID doesn't exist
     ResourceInactive = "RESOURCE_INACTIVE", // Assigned resource is marked inactive
     InvalidBookingStatus = "INVALID_BOOKING_STATUS", // Not 'Confirmed' or similar status
+    LeadCourierInvalid = "LEAD_COURIER_INVALID", // Added
 }
 
 // --- Interfaces ---
@@ -53,12 +54,12 @@ export const assignEventResources = functions.https.onCall(
         timeoutSeconds: 60,
     },
     async (request): Promise<{ success: true } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[assignEventResources V2 - Permissions]"; // Updated version name
+        const functionName = "[assignEventResources V2 - Permissions]";
         const startTimeFunc = Date.now();
 
         // 1. Authentication & Authorization
         if (!request.auth?.uid) { return { success: false, error: "error.auth.unauthenticated", errorCode: ErrorCode.Unauthenticated }; }
-        const adminUserId = request.auth.uid; // Admin performing the action
+        const adminUserId = request.auth.uid;
         const data = request.data as AssignEventResourcesInput;
         const logContext: any = { adminUserId, bookingId: data?.bookingId };
 
@@ -66,8 +67,8 @@ export const assignEventResources = functions.https.onCall(
 
         // 2. Input Validation
         if (!data?.bookingId || typeof data.bookingId !== 'string' ||
-            !data?.assignments || typeof data.assignments !== 'object' || Object.keys(data.assignments).length === 0 || // Must have at least one assignment type
-            Object.values(data.assignments).some(ids => !Array.isArray(ids) || ids.some(id => typeof id !== 'string')) || // Validate structure
+            !data?.assignments || typeof data.assignments !== 'object' || Object.keys(data.assignments).length === 0 ||
+            Object.values(data.assignments).some(ids => !Array.isArray(ids) || ids.some(id => typeof id !== 'string')) ||
             (data.leadCourierId != null && typeof data.leadCourierId !== 'string'))
         {
             logger.error(`${functionName} Invalid input data structure or types.`, { ...logContext, data: JSON.stringify(data).substring(0,500) });
@@ -81,7 +82,7 @@ export const assignEventResources = functions.https.onCall(
         let bookingData: EventBooking;
         let adminUserData: User;
         let adminUserRole: string | null;
-        const allResourceIds = Object.values(assignments).flat(); // Get all resource IDs to validate
+        const allResourceIds = Object.values(assignments).flat();
 
         // --- Firestore References ---
         const bookingRef = db.collection('eventBookings').doc(bookingId);
@@ -91,13 +92,11 @@ export const assignEventResources = functions.https.onCall(
             // 3. Fetch Admin User and Booking Data Concurrently
             const [adminUserSnap, bookingSnap] = await Promise.all([adminUserRef.get(), bookingRef.get()]);
 
-            // Validate Admin User
             if (!adminUserSnap.exists) throw new HttpsError('not-found', `error.user.notFound::${adminUserId}`, { errorCode: ErrorCode.UserNotFound });
             adminUserData = adminUserSnap.data() as User;
-            adminUserRole = adminUserData.role; // Get admin role
+            adminUserRole = adminUserData.role;
             logContext.adminUserRole = adminUserRole;
 
-            // Validate Booking
             if (!bookingSnap.exists) {
                 logger.warn(`${functionName} Event booking ${bookingId} not found.`, logContext);
                 return { success: false, error: "error.event.bookingNotFound", errorCode: ErrorCode.BookingNotFound };
@@ -106,9 +105,7 @@ export const assignEventResources = functions.https.onCall(
             logContext.currentStatus = bookingData.bookingStatus;
             logContext.customerId = bookingData.customerId;
 
-            // 4. Permission Check (Using REAL helper)
-            // Admin needs permission to assign resources. Define: 'event:assignResource'
-            // Pass fetched role to checkPermission
+            // 4. Permission Check
             const hasPermission = await checkPermission(adminUserId, adminUserRole, 'event:assignResource', logContext);
             if (!hasPermission) {
                 logger.warn(`${functionName} Permission denied for admin ${adminUserId} (Role: ${adminUserRole}) to assign resources to booking ${bookingId}.`, logContext);
@@ -116,14 +113,13 @@ export const assignEventResources = functions.https.onCall(
             }
 
             // 5. State Validation
-            // Allow assignment only when confirmed or scheduled?
             const assignableStatuses: string[] = [EventBookingStatus.Confirmed.toString(), EventBookingStatus.Scheduled.toString()];
             if (!assignableStatuses.includes(bookingData.bookingStatus)) {
                 logger.warn(`${functionName} Event booking ${bookingId} is not in a status where resources can be assigned (current: ${bookingData.bookingStatus}).`, logContext);
                 return { success: false, error: `error.event.invalidStatus.assign::${bookingData.bookingStatus}`, errorCode: ErrorCode.InvalidBookingStatus };
             }
 
-            // 6. Validate Assigned Resources (Existence and Activity)
+            // 6. Validate Assigned Resources
             if (allResourceIds.length > 0) {
                 logger.info(`${functionName} Validating ${allResourceIds.length} assigned resources...`, logContext);
                 const resourceRefs = allResourceIds.map(id => db.collection('eventResources').doc(id));
@@ -131,7 +127,7 @@ export const assignEventResources = functions.https.onCall(
 
                 for (const doc of resourceDocs) {
                     if (!doc.exists) {
-                        const missingId = allResourceIds.find(id => id === doc.ref.id); // Find which ID was missing
+                        const missingId = allResourceIds.find(id => id === doc.ref.id);
                         logger.error(`${functionName} Assigned resource ID ${missingId} not found.`, logContext);
                         throw new HttpsError('not-found', `error.event.resourceNotFound::${missingId}`, { errorCode: ErrorCode.ResourceNotFound });
                     }
@@ -143,36 +139,29 @@ export const assignEventResources = functions.https.onCall(
                 }
                 logger.info(`${functionName} All assigned resources validated successfully.`, logContext);
             }
-            // Optional: Validate leadCourierId exists and is a courier?
             if (leadCourierId) {
                  const leadCourierSnap = await db.collection('users').doc(leadCourierId).get();
                  if (!leadCourierSnap.exists || leadCourierSnap.data()?.role !== 'Courier') {
                       logger.error(`${functionName} Assigned lead courier ${leadCourierId} not found or is not a courier.`, logContext);
-                      throw new HttpsError('not-found', `error.event.leadCourierInvalid::${leadCourierId}`, { errorCode: ErrorCode.UserNotFound }); // Reuse UserNotFound?
+                      throw new HttpsError('not-found', `error.event.leadCourierInvalid::${leadCourierId}`, { errorCode: ErrorCode.LeadCourierInvalid });
                  }
             }
 
-
             // 7. Update Event Booking Document
             const now = Timestamp.now();
-            // Determine new status - maybe move to 'Scheduled' once resources are assigned?
             const newStatus = EventBookingStatus.Scheduled;
             logContext.newStatus = newStatus;
 
             const updateData: { [key: string]: any } = {
-                assignedResources: assignments, // Store the map directly
+                assignedResources: assignments,
                 assignedLeadCourierId: leadCourierId ?? null,
-                bookingStatus: newStatus, // Update status
+                bookingStatus: newStatus,
                 updatedAt: FieldValue.serverTimestamp(),
                 statusChangeHistory: FieldValue.arrayUnion({
-                    from: bookingData.bookingStatus,
-                    to: newStatus,
-                    timestamp: now,
-                    userId: adminUserId,
-                    role: adminUserRole,
+                    from: bookingData.bookingStatus, to: newStatus, timestamp: now, userId: adminUserId, role: adminUserRole,
                     reason: `Resources assigned by admin`
                 }),
-                processingError: null, // Clear previous errors
+                processingError: null,
             };
 
             logger.info(`${functionName} Updating event booking ${bookingId} with assigned resources and status ${newStatus}...`, logContext);
@@ -183,7 +172,7 @@ export const assignEventResources = functions.https.onCall(
             logAdminAction("AssignEventResources", {
                 bookingId, customerId: bookingData.customerId, assignments, leadCourierId,
                 triggerUserId: adminUserId, triggerUserRole: adminUserRole
-            }).catch(err => logger.error("Failed logging admin action", { err }));
+            }).catch(err => logger.error("Failed logging AssignEventResources admin action", { err })); // Fixed catch
 
             // 9. Return Success
             return { success: true };
@@ -201,9 +190,9 @@ export const assignEventResources = functions.https.onCall(
                  if (!Object.values(ErrorCode).includes(finalErrorCode)) finalErrorCode = ErrorCode.InternalError;
                  if (error.message.includes("::")) { finalErrorMessageKey = error.message; }
             }
-            // No transaction errors expected here unless DB fails
 
-            logAdminAction("AssignEventResourcesFailed", { bookingId, assignments, leadCourierId, error: error.message, triggerUserId: adminUserId }).catch(...)
+            logAdminAction("AssignEventResourcesFailed", { bookingId, assignments, leadCourierId, error: error.message, triggerUserId: adminUserId })
+                .catch(err => logger.error("Failed logging AssignEventResourcesFailed admin action", { err })); // Fixed catch
 
             return { success: false, error: finalErrorMessageKey, errorCode: finalErrorCode };
         } finally {

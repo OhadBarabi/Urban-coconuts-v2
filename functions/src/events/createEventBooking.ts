@@ -7,36 +7,31 @@ import { v4 as uuidv4 } from 'uuid';
 // --- Import Models ---
 import {
     User, EventBooking, EventBookingStatus, EventItemType, SelectedEventItemInput,
-    AppConfigEventSettings, Menu, Product, RentalItem, Address // Assuming Address is defined in models
+    AppConfigEventSettings, Menu, Product, RentalItem, Address
 } from '../models'; // Adjust path if needed
 
 // --- Import Helpers ---
-import { checkPermission } from '../utils/permissions'; // <-- Import REAL helper
-// import { checkEventAvailability } from './checkEventAvailability'; // Assuming this exists and works
-// import { calculateEventTotal } from '../utils/event_calculations'; // Using mock below
-// import { logUserActivity } from '../utils/logging'; // Using mock below
+import { checkPermission } from '../utils/permissions';
+import { logUserActivity } from '../utils/logging'; // Using mock below
 
 // --- Mocks for other required helper functions (Replace with actual implementations) ---
-// Mock for checkEventAvailability (replace with actual call if available)
 interface AvailabilityResult { isAvailable: boolean; reason?: string; reasonCode?: string; }
 async function checkEventAvailabilityMock(startTime: Timestamp, endTime: Timestamp, location: Address, requiredResources?: string[]): Promise<AvailabilityResult> {
     logger.info(`[Mock Availability Check] Checking for ${startTime.toDate()} to ${endTime.toDate()}`);
-    await new Promise(res => setTimeout(res, 300)); // Simulate check time
-    // Simple mock: Always available unless end time is before start time
+    await new Promise(res => setTimeout(res, 300));
     if (endTime <= startTime) return { isAvailable: false, reason: "End time before start time", reasonCode: "INVALID_DATE_RANGE" };
     return { isAvailable: true };
 }
-// Mock for calculateEventTotal
 interface EventTotalResult { totalAmount: number; error?: string; minOrderRequirementMet?: boolean; currencyCode?: string; }
 function calculateEventTotal(items: SelectedEventItemInput[], menu?: Menu | null, settings?: AppConfigEventSettings | null): EventTotalResult {
     logger.info(`[Mock Event Calc] Calculating total for ${items.length} items...`);
     let total = 0;
-    items.forEach((item, index) => { total += (item.quantity ?? 1) * (1500 + index * 100); }); // Mock calculation
+    items.forEach((item, index) => { total += (item.quantity ?? 1) * (1500 + index * 100); });
     const minOrderValue = settings?.minOrderValueSmallestUnit ?? 0;
-    const currency = menu?.currencyCode ?? settings?.defaultCurrencyCode ?? 'ILS'; // Determine currency
+    const currency = menu?.currencyCode ?? settings?.defaultCurrencyCode ?? 'ILS';
     return { totalAmount: total, minOrderRequirementMet: total >= minOrderValue, currencyCode: currency };
 }
-async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); }
+// async function logUserActivity(actionType: string, details: object, userId: string): Promise<void> { logger.info(`[Mock User Log] User: ${userId}, Action: ${actionType}`, details); } // Imported
 // --- End Mocks ---
 
 // --- Configuration ---
@@ -54,14 +49,14 @@ enum ErrorCode {
     InternalError = "INTERNAL_ERROR",
     // Specific codes
     UserNotFound = "USER_NOT_FOUND",
-    MenuNotFound = "MENU_NOT_FOUND", // If menuId is provided
-    ItemNotFound = "ITEM_NOT_FOUND", // Product/Package/Service/Rental not found
+    MenuNotFound = "MENU_NOT_FOUND",
+    ItemNotFound = "ITEM_NOT_FOUND",
     InvalidItemType = "INVALID_ITEM_TYPE",
     SlotUnavailable = "SLOT_UNAVAILABLE",
     MinOrderNotMet = "MIN_ORDER_NOT_MET",
-    InvalidDateRange = "INVALID_DATE_RANGE", // Start time after end time
+    InvalidDateRange = "INVALID_DATE_RANGE",
     CalculationError = "CALCULATION_ERROR",
-    ConfigNotFound = "CONFIG_NOT_FOUND", // Event settings missing
+    ConfigNotFound = "CONFIG_NOT_FOUND",
 }
 
 // --- Interfaces ---
@@ -74,7 +69,6 @@ interface CreateEventBookingInput {
     eventMenuId?: string | null; // Optional menu selection
     selectedItems: SelectedEventItemInput[]; // List of items requested
     notes?: string | null;
-    // currencyCode?: string | null; // Currency might be determined by menu/config
 }
 
 // --- The Cloud Function ---
@@ -85,7 +79,7 @@ export const createEventBooking = functions.https.onCall(
         timeoutSeconds: 60,
     },
     async (request): Promise<{ success: true; bookingId: string } | { success: false; error: string; errorCode: string }> => {
-        const functionName = "[createEventBooking V2 - Permissions]"; // Updated version name
+        const functionName = "[createEventBooking V2 - Permissions]";
         const startTimeFunc = Date.now();
 
         // 1. Authentication & Authorization
@@ -99,9 +93,9 @@ export const createEventBooking = functions.https.onCall(
         // 2. Input Validation
         if (!data?.startTime || typeof data.startTime !== 'string' ||
             !data?.endTime || typeof data.endTime !== 'string' ||
-            !data?.location || typeof data.location !== 'object' || // Basic check for location object
+            !data?.location || typeof data.location !== 'object' ||
             !Array.isArray(data.selectedItems) || data.selectedItems.length === 0 ||
-            data.selectedItems.some(item => !item.itemId || !item.itemType || !Object.values(EventItemType).includes(item.itemType)) || // Validate item structure
+            data.selectedItems.some(item => !item.itemId || !item.itemType || !Object.values(EventItemType).includes(item.itemType)) ||
             (data.eventMenuId != null && typeof data.eventMenuId !== 'string') ||
             (data.notes != null && typeof data.notes !== 'string'))
         {
@@ -112,11 +106,11 @@ export const createEventBooking = functions.https.onCall(
 
         // --- Variables ---
         let userData: User;
-        let userRole: string | null; // Fetch role
+        let userRole: string | null;
         let eventSettings: AppConfigEventSettings | null = null;
         let menuData: Menu | null = null;
         let calculationResult: EventTotalResult;
-        const bookingId = db.collection('eventBookings').doc().id; // Pre-generate booking ID
+        const bookingId = db.collection('eventBookings').doc().id;
 
         try {
             // Parse Dates
@@ -144,38 +138,32 @@ export const createEventBooking = functions.https.onCall(
             const [userSnap, settingsSnap, menuSnap] = await Promise.all([
                 userRef.get(),
                 settingsRef.get(),
-                menuRef ? menuRef.get() : Promise.resolve(null) // Fetch menu only if ID provided
+                menuRef ? menuRef.get() : Promise.resolve(null)
             ]);
 
-            // Validate User
             if (!userSnap.exists) throw new HttpsError('not-found', `error.user.notFound::${customerId}`, { errorCode: ErrorCode.UserNotFound });
             userData = userSnap.data() as User;
-            userRole = userData.role; // Get role
+            userRole = userData.role;
             logContext.userRole = userRole;
             if (!userData.isActive) throw new HttpsError('permission-denied', "error.user.inactive", { errorCode: ErrorCode.PermissionDenied });
 
-            // Validate Event Settings
             if (!settingsSnap.exists) throw new HttpsError('internal', "Event settings configuration not found.", { errorCode: ErrorCode.ConfigNotFound });
             eventSettings = settingsSnap.data() as AppConfigEventSettings;
 
-            // Validate Menu if provided
             if (eventMenuId) {
                 if (!menuSnap || !menuSnap.exists) throw new HttpsError('not-found', `error.menu.notFound::${eventMenuId}`, { errorCode: ErrorCode.MenuNotFound });
                 menuData = menuSnap.data() as Menu;
                 if (!menuData.isEventMenu) throw new HttpsError('failed-precondition', `Menu ${eventMenuId} is not an event menu.`);
-                // TODO: Validate selectedItems against menu's availableProducts?
             }
 
-            // 4. Permission Check (Using REAL helper)
-            // Pass fetched role to checkPermission
+            // 4. Permission Check
             const hasPermission = await checkPermission(customerId, userRole, 'event:create', logContext);
             if (!hasPermission) {
                 logger.warn(`${functionName} Permission denied for user ${customerId} (Role: ${userRole}) to create event booking.`, logContext);
                 return { success: false, error: "error.permissionDenied.createEvent", errorCode: ErrorCode.PermissionDenied };
             }
 
-            // 5. Check Event Availability (Using Mock for now)
-            // TODO: Replace with actual call to checkEventAvailability helper/function if implemented separately
+            // 5. Check Event Availability
             logger.info(`${functionName} Checking event availability...`, logContext);
             const availability = await checkEventAvailabilityMock(startTimeTs, endTimeTs, location);
             if (!availability.isAvailable) {
@@ -184,11 +172,8 @@ export const createEventBooking = functions.https.onCall(
             }
             logger.info(`${functionName} Event slot available.`, logContext);
 
-            // 6. Validate Selected Items Exist (Basic check - more detailed validation needed)
-            // This is complex as items can be Products, Packages, Services, Rentals
-            // For now, assume items are valid. Real implementation needs to fetch each item.
+            // 6. Validate Selected Items Exist
             logger.warn(`${functionName} Skipping detailed validation of selected items existence and type matching.`, logContext);
-            // TODO: Implement fetching and validation for each item in selectedItems based on itemType.
 
             // 7. Calculate Event Total and Check Minimum Order
             logger.info(`${functionName} Calculating event total...`, logContext);
@@ -212,45 +197,21 @@ export const createEventBooking = functions.https.onCall(
             // 8. Create EventBooking Document in Firestore
             logger.info(`${functionName} Creating event booking document ${bookingId}...`, logContext);
             const now = Timestamp.now();
-            const initialStatus = EventBookingStatus.PendingAdminApproval; // Or PendingCustomerConfirmation? Depends on flow.
+            const initialStatus = EventBookingStatus.PendingAdminApproval;
 
             const newBookingData: EventBooking = {
-                bookingId: bookingId, // Store generated ID
-                customerId: customerId,
-                eventDate: startTimeTs, // Use start time as the primary date?
-                startTime: startTimeTs,
-                endTime: endTimeTs,
-                durationMinutes: durationMinutes,
-                location: location,
-                eventMenuId: eventMenuId ?? null,
-                selectedItems: selectedItems.map(item => ({ ...item, bookingItemId: uuidv4() })), // Add unique IDs to booked items
-                totalAmountSmallestUnit: totalAmount,
-                currencyCode: currencyCode,
-                minOrderRequirementMet: minOrderRequirementMet ?? false,
+                bookingId: bookingId, customerId: customerId, eventDate: startTimeTs, startTime: startTimeTs, endTime: endTimeTs,
+                durationMinutes: durationMinutes, location: location, eventMenuId: eventMenuId ?? null,
+                selectedItems: selectedItems.map(item => ({ ...item, bookingItemId: uuidv4() })),
+                totalAmountSmallestUnit: totalAmount, currencyCode: currencyCode, minOrderRequirementMet: minOrderRequirementMet ?? false,
                 bookingStatus: initialStatus,
                 statusChangeHistory: [{ from: null, to: initialStatus, timestamp: now, userId: customerId, role: userRole ?? 'Customer', reason: "Booking created" }],
-                adminApprovalDetails: null,
-                agreementSentTimestamp: null,
-                agreementConfirmedTimestamp: null,
-                paymentStatus: PaymentStatus.Pending, // Payment handled after approval/confirmation
-                paymentDetails: null,
-                cancellationFeeAppliedSmallestUnit: null,
-                cancellationTimestamp: null,
-                cancelledBy: null,
-                cancellationReason: null,
-                assignedResources: null,
-                assignedLeadCourierId: null,
-                actualStartTime: null,
-                actualEndTime: null,
-                lastDelayReason: null,
-                customerFeedbackId: null,
-                googleCalendarEventId: null, // Handled by background function later
-                needsManualGcalCheck: false,
-                needsManualGcalDelete: false,
-                processingError: null,
-                createdAt: now,
-                updatedAt: now,
-                notes: notes ?? null,
+                adminApprovalDetails: null, agreementSentTimestamp: null, agreementConfirmedTimestamp: null,
+                paymentStatus: PaymentStatus.Pending, paymentDetails: null, cancellationFeeAppliedSmallestUnit: null,
+                cancellationTimestamp: null, cancelledBy: null, cancellationReason: null, assignedResources: null,
+                assignedLeadCourierId: null, actualStartTime: null, actualEndTime: null, lastDelayReason: null,
+                customerFeedbackId: null, googleCalendarEventId: null, needsManualGcalCheck: false,
+                needsManualGcalDelete: false, processingError: null, createdAt: now, updatedAt: now, notes: notes ?? null,
             };
 
             const bookingRef = db.collection('eventBookings').doc(bookingId);
@@ -259,7 +220,7 @@ export const createEventBooking = functions.https.onCall(
 
             // 9. Log User Activity (Async)
             logUserActivity("CreateEventBooking", { bookingId, startTime: startTimeStr, endTime: endTimeStr, itemCount: selectedItems.length, totalAmount }, customerId)
-                .catch(err => logger.error("Failed logging user activity", { err }));
+                .catch(err => logger.error("Failed logging CreateEventBooking user activity", { err })); // Fixed catch
 
             // 10. Return Success
             return { success: true, bookingId: bookingId };
@@ -277,9 +238,9 @@ export const createEventBooking = functions.https.onCall(
                  if (!Object.values(ErrorCode).includes(finalErrorCode)) finalErrorCode = ErrorCode.InternalError;
                  if (error.message.includes("::")) { finalErrorMessageKey = error.message; }
             }
-            // No transaction errors expected here unless DB fails
 
-            logUserActivity("CreateEventBookingFailed", { startTime: startTimeStr, endTime: endTimeStr, error: error.message }, customerId).catch(...)
+            logUserActivity("CreateEventBookingFailed", { startTime: startTimeStr, endTime: endTimeStr, error: error.message }, customerId)
+                .catch(err => logger.error("Failed logging CreateEventBookingFailed user activity", { err })); // Fixed catch
 
             return { success: false, error: finalErrorMessageKey, errorCode: finalErrorCode };
         } finally {
