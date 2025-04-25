@@ -1,542 +1,622 @@
-import * as admin from "firebase-admin";
+import * as admin from 'firebase-admin';
 
-// --- Enums (Mirroring Backend Logic) ---
-export enum Role {
-  Customer = "Customer",
-  Courier = "Courier",
-  Admin = "Admin",
-  SuperAdmin = "SuperAdmin",
+/** Enum representing possible user roles. */
+export enum UserRole {
+  Admin = 'Admin',
+  Manager = 'Manager',
+  Courier = 'Courier',
+  Customer = 'Customer',
+  EventStaff = 'EventStaff',
 }
 
-export enum CourierShiftStatus {
-  OnDuty = "OnDuty",
-  OffDuty = "OffDuty",
-  Break = "Break",
+/** Enum representing permission keys for various actions. */
+export enum PermissionKey {
+  UserCreate = 'user:create',
+  UserRead = 'user:read',
+  UserUpdate = 'user:update',
+  UserDelete = 'user:delete',
+  RoleManage = 'role:manage',
+  ProductManage = 'product:manage',
+  OrderCreate = 'order:create',
+  OrderUpdateStatus = 'order:updateStatus',
+  RentalCreate = 'rental:create',
+  RentalManage = 'rental:manage',
+  RentalConfirmPickup = 'rental:confirmPickup',
+  RentalConfirmReturn = 'rental:confirmReturn',
+  EventManage = 'event:manage',
+  ReportView = 'report:view',
+  SystemConfig = 'system:config',
+  CourierManageShifts = 'courier:manageShifts',
+  BoxManageInventory = 'box:manageInventory',
 }
 
-export enum OrderStatus {
-  Red = "Red", // New, Unassigned
-  Yellow = "Yellow", // Assigned, Preparing
-  Green = "Green", // Ready for Pickup / En Route
-  Black = "Black", // Delivered / Completed
-  Cancelled = "Cancelled", // Generic Cancelled
-}
-
-export enum PaymentMethod {
-  CreditCardApp = "CreditCardApp",
-  BitApp = "BitApp",
-  UC_Coins_Only = "UC_Coins_Only",
-  CashOnDelivery = "CashOnDelivery",
-  CreditOnDelivery = "CreditOnDelivery",
-}
-
-export enum PaymentStatus {
-  Pending = "Pending",
-  PendingCourier = "PendingCourier", // For Cash/Credit on Delivery
-  Authorized = "Authorized",
-  Paid = "Paid", // Captured successfully
-  Failed = "Failed", // Auth or Capture failed
-  Voided = "Voided",
-  Captured = "Captured", // Explicit capture state if needed
-  Refunded = "Refunded",
-  PartiallyRefunded = "PartiallyRefunded",
-  CaptureFailed = "CaptureFailed",
-  VoidFailed = "VoidFailed",
-  RefundFailed = "RefundFailed",
-  PaidToCourier = "PaidToCourier", // Cash paid to courier
-  Cancelled = "Cancelled", // If order cancelled before payment processed
-}
-
-export enum RentalBookingStatus {
-    PendingDeposit = "PendingDeposit",
-    DepositAuthorized = "DepositAuthorized", // Deposit auth succeeded
-    DepositFailed = "DepositFailed",
-    AwaitingPickup = "AwaitingPickup", // Deposit OK, ready for pickup
-    PickedUp = "PickedUp", // Item collected by customer
-    AwaitingReturn = "AwaitingReturn", // Alias for PickedUp? Or separate? Let's use PickedUp
-    ReturnOverdue = "ReturnOverdue", // Past expected return time
-    ReturnedPendingInspection = "ReturnedPendingInspection", // Returned to box, needs check
-    ReturnProcessing = "ReturnProcessing", // Courier processing return
-    ReturnCompleted = "ReturnCompleted", // Return processed, final payment calculated
-    AwaitingFinalPayment = "AwaitingFinalPayment", // Final payment pending
-    PaymentFailed = "PaymentFailed", // Final payment failed
-    Completed = "Completed", // Final payment successful
-    Cancelled = "Cancelled", // Cancelled before pickup
-    RequiresManualReview = "RequiresManualReview", // Error state
-}
-
-export enum EventBookingStatus {
-    PendingAdminApproval = "PendingAdminApproval",
-    PendingCustomerAgreement = "PendingCustomerAgreement",
-    Confirmed = "Confirmed",
-    Preparing = "Preparing",
-    InProgress = "InProgress",
-    Delayed = "Delayed",
-    Completed = "Completed",
-    CancelledByAdmin = "CancelledByAdmin",
-    CancelledByCustomer = "CancelledByCustomer",
-    RequiresAdminAttention = "RequiresAdminAttention",
-    RequiresManualReview = "RequiresManualReview", // For payment/GCal failures
-}
-
-export enum EventItemType {
-    Product = "Product",
-    Package = "Package",
-    Service = "Service",
-    Rental = "Rental",
-}
-
-export enum EventResourceType {
-    Team = "Team",
-    Vehicle = "Vehicle",
-    Equipment = "Equipment",
-    StaffMember = "StaffMember",
-}
-
-// --- Helper Interfaces ---
-export interface I18nMap {
-  [langCode: string]: string;
-}
-
-export interface GeoPointJson { // For API input/output if not using Firestore types directly
-  latitude: number;
-  longitude: number;
-}
-
-export interface OperatingHoursRule {
-  start: string; // "HH:MM"
-  end: string;   // "HH:MM"
-}
-
-export interface OperatingHoursMap {
-  // Keys like "Mon", "Tue" etc. or 0-6 for Sun-Sat
-  [day: string]: OperatingHoursRule;
-}
-
-export interface StatusHistoryEntry {
-  status?: string; // The status being set
-  timestamp: admin.firestore.Timestamp;
-  userId?: string | null; // User who triggered the change
-  role?: string | null; // Role of the user
-  reason?: string | null; // Optional reason for change
-  // For Order Status specific
-  from?: string; // Previous status
-  to?: string; // New status
-}
-
-export interface PaymentDetails {
-  // Common fields
-  gatewayName?: string | null;
-  currencyCode?: string | null;
-
-  // Authorization (Deposit or Initial Auth)
-  authTimestamp?: admin.firestore.Timestamp | null;
-  gatewayTransactionId?: string | null; // Auth ID
-  authAmountSmallestUnit?: number | null; // Amount authorized
-  authSuccess?: boolean | null;
-  authError?: string | null;
-
-  // Charge / Capture
-  chargeTimestamp?: admin.firestore.Timestamp | null;
-  chargeTransactionId?: string | null; // Capture/Charge ID
-  chargeAmountSmallestUnit?: number | null; // Amount captured/charged
-  chargeSuccess?: boolean | null;
-  chargeError?: string | null;
-
-  // Void
-  voidTimestamp?: admin.firestore.Timestamp | null;
-  voidSuccess?: boolean | null;
-  voidError?: string | null;
-
-  // Refund
-  refundTimestamp?: admin.firestore.Timestamp | null;
-  refundId?: string | null; // Refund transaction ID from gateway
-  refundAmountSmallestUnit?: number | null; // Amount refunded
-  refundSuccess?: boolean | null;
-  refundError?: string | null;
-
-  // Settlement / Finalization (e.g., for rentals)
-  settlementTimestamp?: admin.firestore.Timestamp | null;
-  settlementTransactionId?: string | null; // ID of final charge/refund if different
-  settlementAmountSmallestUnit?: number | null; // Net amount settled
-  settlementSuccess?: boolean | null;
-  settlementError?: string | null;
-  finalizationSuccess?: boolean | null; // Flag from confirmAgreement
-
-  // Cash related
-  cashPaymentReceived?: boolean | null;
-  cashReceivedTimestamp?: admin.firestore.Timestamp | null;
-  cashReceivingCourierId?: string | null;
-}
-
-export interface AdminApprovalDetails {
-    status: "Approved" | "Rejected" | "ApprovedWithChanges" | "Pending";
-    adminUserId?: string | null; // User who performed action
-    timestamp?: admin.firestore.Timestamp | null;
-    notes?: string | null;
-}
-
-// --- Firestore Document Interfaces (V5) ---
-
+/** Interface representing a user in the system. */
 export interface User {
-  uid: string;
-  email?: string | null;
-  phoneNumber: string;
-  displayName?: string | null;
-  photoURL?: string | null;
-  role: Role | string;
-  permissions?: string[] | null;
-  groups?: string[] | null;
+  /** Unique identifier for the user. */
+  userId: string;
+  /** User's email address. */
+  email: string;
+  /** User's phone number (optional). */
+  phoneNumber?: string;
+  /** User's first name. */
+  firstName: string;
+  /** User's last name. */
+  lastName: string;
+  /** User's role. */
+  role: UserRole;
+  /** Indicates if the user is active. */
   isActive: boolean;
-  isMfaEnabled?: boolean;
-  // mfaSecret: string | null; // Should not be directly in DB model if possible
-  preferredLanguage?: string | null;
+  /** Timestamp indicating when the user was created. */
   createdAt: admin.firestore.Timestamp;
-  lastLoginTimestamp?: admin.firestore.Timestamp | null;
-  vipTier?: string | null;
-  vipTierLastCalculated?: admin.firestore.Timestamp | null;
-  ucCoinBalance?: number; // Integer
-  paymentGatewayCustomerId?: string | null;
-  inactivityFlag?: string | null;
-  updatedAt?: admin.firestore.Timestamp;
-
-  // Courier specific fields (only if role === Role.Courier)
-  shiftStatus?: CourierShiftStatus | string;
-  currentShiftId?: string | null;
-  currentBoxId?: string | null;
-  assignedBoxIds?: string[] | null; // V5
-  cashOnHand?: number; // Integer
-  pickupTimeBufferMinutes?: number | null; // Integer, V5
-  averageRating?: number | null;
-  ratingCount?: number | null;
-  ratingLastCalculated?: admin.firestore.Timestamp | null;
+  /** Timestamp indicating when the user was last updated. */
+  updatedAt: admin.firestore.Timestamp;
+  /** Payment gateway customer ID (optional). */
+  paymentGatewayCustomerId?: string;
+  /** VIP tier (optional). */
+  vipTier?: string;
+  /** Indicates if multi-factor authentication is enabled. */
+  mfaEnabled: boolean;
 }
 
+/** Interface representing a role with associated permissions. */
+export interface Role {
+  /** Unique identifier for the role (same as UserRole). */
+  roleId: UserRole;
+  /** Display name of the role. */
+  displayName: string;
+  /** Array of permission keys granted to the role. */
+  permissions: PermissionKey[];
+}
+
+/** Interface representing a box location. */
 export interface Box {
-  boxNumber: string; // V5
-  boxName_i18n?: I18nMap | null;
-  location: admin.firestore.GeoPoint; // For GeoFirestore
-  g?: { geohash: string; geopoint: admin.firestore.GeoPoint }; // Field added by GeoFirestore
+  /** Unique identifier for the box. */
+  boxId: string;
+  /** Name of the box. */
+  name: string;
+  /** Geo location of the box. */
+  location: admin.firestore.GeoPoint;
+  /** Address of the box. */
+  address: string;
+  /** Indicates if the box is active. */
   isActive: boolean;
-  isCustomerVisible: boolean;
-  priority: number; // V5
-  colorCode?: string | null;
+  /** Currency code used by the box. */
   currencyCode: string;
-  countryCode?: string;
-  address?: string | null;
-  assignedCourierId?: string | null; // Ref: users
-  assignedMenuIds?: string[] | null; // Assume sorted by menu priority
-  hiddenProductIds?: string[] | null;
-  operatingHours?: OperatingHoursMap | null;
-  inventory?: { [productId: string]: number }; // Map<String, Integer>
-  createdAt?: admin.firestore.Timestamp;
-  updatedAt?: admin.firestore.Timestamp;
+  /** Rental inventory mapping (rental item ID to quantity). */
+  rentalInventory: { [rentalItemId: string]: number };
+  /** Operating hours of the box (optional). */
+  operatingHours?: object;
+  /** Notes for the box (optional). */
+  notes?: string;
+  /** Timestamp indicating when the box was created. */
+  createdAt: admin.firestore.Timestamp;
+  /** Timestamp indicating when the box was last updated. */
+  updatedAt: admin.firestore.Timestamp;
 }
 
-export interface Menu {
-  menuName_i18n: I18nMap;
-  description_i18n?: I18nMap | null;
-  imageUrl?: string | null;
-  priority: number; // V5
-  isActive: boolean;
-  isEventMenu?: boolean;
-  availableProducts?: string[] | null; // Array of product IDs
-  applicableEventTypes?: string[] | null;
-  minOrderValueSmallestUnit?: number | null; // Integer
-  createdAt?: admin.firestore.Timestamp;
-  updatedAt?: admin.firestore.Timestamp;
+export enum FeeInterval {
+  Hourly = 'Hourly',
+  Daily = 'Daily',
+  Weekly = 'Weekly',
 }
 
-export interface Product {
-  productName_i18n: I18nMap;
-  description_i18n?: I18nMap | null;
-  imageUrl?: string | null;
-  category?: string | null;
-  priceSmallestUnit: number; // Integer
-  tags?: string[] | null; // V5
-  priority: number; // V5
-  isActive: boolean;
-  allergens?: string[] | null;
-  nutritionalInfo?: { [key: string]: any }; // Map
-  createdAt?: admin.firestore.Timestamp;
-  updatedAt?: admin.firestore.Timestamp;
-}
-
-export interface OrderItem {
-  orderItemId: string; // Unique ID within the order
-  productId: string; // Ref: products
-  productName: string; // Snapshot (translated based on user pref at time of order?)
-  quantity: number; // Integer
-  unitPrice: number; // Integer, Snapshot
-  itemStatus?: string; // e.g., "PickedUp", "Missing"
-}
-
-export interface Order {
-  orderNumber?: string;
-  customerId: string; // Ref: users
-  courierId?: string | null; // Ref: users
-  boxId: string; // Ref: boxes
-  items: OrderItem[];
-  status: OrderStatus | string;
-  statusHistory?: StatusHistoryEntry[];
-  paymentMethod: PaymentMethod | string;
-  paymentStatus: PaymentStatus | string;
-  currencyCode: string;
-  authDetails?: PaymentDetails | null; // Store initial auth details here
-  paymentDetails?: PaymentDetails | null; // Store final charge/refund details here
-  totalAmount: number; // Integer, sum of item prices
-  ucCoinsUsed?: number | null; // Integer
-  couponCodeUsed?: string | null;
-  couponDiscountValue?: number; // Integer
-  tipAmountSmallestUnit?: number | null; // Integer
-  finalAmount: number; // Integer, final amount charged/to be charged
-  orderTimestamp: admin.firestore.Timestamp;
-  deliveredTimestamp?: admin.firestore.Timestamp | null;
-  pickupTimeWindow?: { start: admin.firestore.Timestamp; end: admin.firestore.Timestamp };
-  notes?: string | null;
-  issueReported?: boolean;
-  issueDetails?: { reportedAt: admin.firestore.Timestamp; reason: string; resolution?: string };
-  orderQrCodeData?: string;
-  cancellationSideEffectsProcessed?: boolean;
-  createdAt?: admin.firestore.Timestamp;
-  updatedAt?: admin.firestore.Timestamp;
-}
-
+/** Interface representing a rental item. */
 export interface RentalItem {
-  itemName_i18n: I18nMap;
-  description_i18n?: I18nMap | null;
-  imageUrl?: string | null;
-  rentalFeeSmallestUnit: number; // Integer
-  depositSmallestUnit: number; // Integer
-  currencyCode?: string;
-  isActive: boolean;
-  attributes?: { [key: string]: any }; // Map
-  createdAt?: admin.firestore.Timestamp;
-  updatedAt?: admin.firestore.Timestamp;
-}
-
-export interface RentalBooking {
-  customerId: string; // Ref: users
-  rentalItemId: string; // Ref: rentalItems
-  bookingStatus: RentalBookingStatus | string;
-  pickupBoxId: string; // Ref: boxes
-  returnBoxId?: string | null; // Ref: boxes
-  pickupCourierId?: string | null; // Ref: users
-  returnCourierId?: string | null; // Ref: users
-  pickupTimestamp?: admin.firestore.Timestamp | null;
-  expectedReturnTimestamp?: admin.firestore.Timestamp | null;
-  actualReturnTimestamp?: admin.firestore.Timestamp | null;
-  returnedCondition?: "OK" | "Dirty" | "Damaged" | string | null;
-  rentalFeeSmallestUnit: number; // Integer, Snapshot
-  depositSmallestUnit: number; // Integer, Snapshot
+  /** Unique identifier for the rental item. */
+  rentalItemId: string;
+  /** Name of the rental item. */
+  name: string;
+  /** Description of the rental item (optional). */
+  description?: string;
+  /** Category of the rental item. */
+  category: string;
+  /** Image URL of the rental item (optional). */
+  imageUrl?: string;
+  /** Deposit for the rental item (in smallest unit). */
+  depositSmallestUnit: number;
+  /** Rental fee for the item (in smallest unit). */
+  rentalFeeSmallestUnit: number;
+  /** Fee interval for the item (Hourly, Daily, Weekly). */
+  feeInterval: FeeInterval;
+  /** Currency code used for the rental item. */
   currencyCode: string;
-  paymentStatus: PaymentStatus | string;
-  paymentDetails?: PaymentDetails | null; // Holds deposit auth/capture/void/refund
-  finalChargeSmallestUnit?: number | null; // Integer, final calculated charge (rental + fees)
-  overtimeFeeChargedSmallestUnit?: number | null; // Integer
-  cleaningFeeChargedSmallestUnit?: number | null; // Integer
-  damageFeeChargedTotalSmallestUnit?: number | null; // Integer
-  depositProcessed?: boolean; // Flag for background function
-  processingError?: string | null;
-  createdAt?: admin.firestore.Timestamp;
-  updatedAt?: admin.firestore.Timestamp;
+  /** Indicates if the rental item is active. */
+  isActive: boolean;
+  /** Indicates if the rental item requires cleaning. */
+  requiresCleaning: boolean;
+  /** Attributes for the rental item (optional). */
+  attributes?: object;
+  /** Timestamp indicating when the rental item was created. */
+  createdAt: admin.firestore.Timestamp;
+  /** Timestamp indicating when the rental item was last updated. */
+  updatedAt: admin.firestore.Timestamp;
 }
 
-export interface EventBookingItem {
-    bookingItemId: string; // Unique ID for this line item within the booking
-    itemId: string; // Original item ID (product, service, package, rental type)
-    itemType: EventItemType | string;
-    productName: string; // Snapshot (translated)
-    quantity?: number | null; // INTEGER
-    durationHours?: number | null; // Number
-    calculatedPriceSmallestUnit: number; // INTEGER - Total price for this line
-    appliedUnitPriceSmallestUnit?: number | null; // INTEGER - Unit/hourly rate applied
-    productId?: string | null; // Link back to original product/rentalItem if needed
-    // Runtime fields for rentals within events (if applicable)
-    returned?: boolean;
-    pickupTimestamp?: admin.firestore.Timestamp | null;
-    expectedReturnTimestamp?: admin.firestore.Timestamp | null;
-    actualReturnTimestamp?: admin.firestore.Timestamp | null;
-    returnedCondition?: string | null;
-    returnBoxId?: string | null;
+/** Enum representing possible rental booking statuses. */
+export enum RentalBookingStatus {
+  PendingPickup = 'PendingPickup',
+  Active = 'Active',
+  PendingReturn = 'PendingReturn',
+  Completed = 'Completed',
+  Cancelled = 'Cancelled',
+  Overdue = 'Overdue',
 }
 
-export interface EventBooking {
-    customerId: string; // Ref: users
-    eventDate: admin.firestore.Timestamp;
-    startTime: admin.firestore.Timestamp;
-    endTime: admin.firestore.Timestamp;
-    durationMinutes?: number; // Calculated
-    location: { address: string; coordinates?: admin.firestore.GeoPoint | null; zoneId?: string | null; notes?: string | null };
-    eventMenuId?: string | null; // Ref: menus
-    selectedItems: EventBookingItem[]; // Use the detailed interface
-    totalAmountSmallestUnit: number; // INTEGER
+/** Enum representing possible payment statuses. */
+export enum PaymentStatus {
+  Pending = 'Pending',
+  Authorized = 'Authorized',
+  Captured = 'Captured',
+  Voided = 'Voided',
+  Refunded = 'Refunded',
+  PartiallyRefunded = 'PartiallyRefunded',
+  Failed = 'Failed',
+  ActionRequired = 'ActionRequired',
+  AuthorizationPending = 'AuthorizationPending',
+  AuthorizationFailed = 'AuthorizationFailed',
+  CaptureFailed = 'CaptureFailed',
+  VoidFailed = 'VoidFailed',
+}
+
+/** Interface for payment details */
+export interface PaymentDetails {
+    transactionId: string;
+    gateway: string;
+    amountSmallestUnit: number;
     currencyCode: string;
-    minOrderRequirementMet?: boolean;
-    bookingStatus: EventBookingStatus | string;
-    statusChangeHistory?: StatusHistoryEntry[];
-    adminApprovalDetails?: AdminApprovalDetails | null;
-    agreementSentTimestamp?: admin.firestore.Timestamp | null;
-    agreementConfirmedTimestamp?: admin.firestore.Timestamp | null;
-    paymentStatus: PaymentStatus | string;
-    paymentDetails?: PaymentDetails | null; // Details of the upfront payment
-    cancellationFeeAppliedSmallestUnit?: number | null; // INTEGER
-    cancellationTimestamp?: admin.firestore.Timestamp | null;
-    cancelledBy?: "Customer" | "Admin" | "SystemAuto" | string | null;
-    cancellationReason?: string | null;
-    assignedResources?: { [resourceType: string]: string[] } | null; // Map<Type, Array<ID>>
-    assignedLeadCourierId?: string | null; // Ref: users (if applicable)
-    actualStartTime?: admin.firestore.Timestamp | null;
-    actualEndTime?: admin.firestore.Timestamp | null;
-    lastDelayReason?: string | null;
-    customerFeedbackId?: string | null; // Ref: userFeedback
-    googleCalendarEventId?: string | null;
-    needsManualGcalCheck?: boolean | null;
-    needsManualGcalDelete?: boolean | null;
-    processingError?: string | null;
-    createdAt?: admin.firestore.Timestamp;
-    updatedAt?: admin.firestore.Timestamp;
+    status: PaymentStatus;
+    timestamp: admin.firestore.Timestamp;
+    paymentMethodType: string;
+    last4?: string;
+    authorizationId?: string;
+    captureId?: string;
+    voidId?: string;
+    refundDetails?: RefundDetails[];
+    errorCode?: string;
+    errorMessage?: string;
 }
 
-export interface EventResource {
-    resourceType: EventResourceType | string;
-    name: string;
-    details?: { [key: string]: any }; // Map
-    email?: string | null; // For attendees
-    baseLocation?: admin.firestore.GeoPoint | null;
-    isActive: boolean;
-    createdAt?: admin.firestore.Timestamp;
-    updatedAt?: admin.firestore.Timestamp;
+/** Interface for refund details */
+export interface RefundDetails {
+  refundId: string;
+  amountSmallestUnit: number;
+  currencyCode: string;
+  timestamp: admin.firestore.Timestamp;
+  reason?: string;
 }
 
-export interface Shift {
-    courierId: string; // Ref: users
-    boxId: string; // Ref: boxes
-    startTime: admin.firestore.Timestamp;
-    endTime?: admin.firestore.Timestamp | null;
-    startCashSmallestUnit: number; // Integer
-    endCashSmallestUnit?: number | null; // Integer
-    expectedEndCashSmallestUnit?: number | null; // Integer
-    cashDifferenceSmallestUnit?: number | null; // Integer
-    isConfirmedByAdmin?: boolean;
-    confirmationTimestamp?: admin.firestore.Timestamp | null;
-    confirmingAdminId?: string | null;
-    notes?: string | null;
-    createdAt?: admin.firestore.Timestamp;
-    updatedAt?: admin.firestore.Timestamp;
+/** Enum representing who initiated a cancellation. */
+ export enum CancellationInitiator {
+   Customer = 'Customer',
+   System = 'System',
+   Staff = 'Staff',
+ }
+
+/** Interface representing cancellation details for bookings or orders. */
+export interface CancellationDetails {
+  cancelledBy: CancellationInitiator;
+  cancellationReason?: string;
+  cancellationTimestamp: admin.firestore.Timestamp;
+  refundProcessed: boolean;
+  refundDetails?: RefundDetails;
 }
 
-export interface RoleDoc {
-    roleName?: string;
-    description?: string | null;
-    permissions: string[];
+/** Interface representing a rental booking. */
+export interface RentalBooking {
+  /** Unique identifier for the booking. */
+  bookingId: string;
+  /** Customer who made the booking. */
+  customerId: string;
+  /** Rental item being booked. */
+  rentalItemId: string;
+  /** Status of the rental booking. */
+  bookingStatus: RentalBookingStatus;
+  /** Box where the item will be picked up. */
+  pickupBoxId: string;
+  /** Box where the item should be returned (optional). */
+  returnBoxId?: string;
+  /** Timestamp for when the item should be picked up (optional). */
+  pickupTimestamp?: admin.firestore.Timestamp;
+  /** Timestamp for when the item should be returned (optional). */
+  expectedReturnTimestamp?: admin.firestore.Timestamp;
+  /** Timestamp for when the item was actually returned (optional). */
+  actualReturnTimestamp?: admin.firestore.Timestamp;
+  /** Timestamp indicating when the booking was created. */
+  createdAt: admin.firestore.Timestamp;
+  /** Timestamp indicating when the booking was last updated. */
+  updatedAt: admin.firestore.Timestamp;
+  /** Deposit for the booking (in smallest unit). */
+  depositSmallestUnit: number;
+  /** Currency code used for the booking. */
+  currencyCode: string;
+  /** Payment status for this booking. */
+  paymentStatus: PaymentStatus;
+  /** Payment details for this booking. */
+  paymentDetails?: PaymentDetails;
+  /** Final charge for the booking, after return (optional, in smallest unit) */
+  finalChargeSmallestUnit?: number;
+  /** Payment details for the final charge (optional) */
+  finalChargePaymentDetails?: PaymentDetails;
+  /** Cancellation details if the booking is cancelled (optional). */
+  cancellationDetails?: CancellationDetails;
+  /** Notes from courier on return, if any. */
+  courierNotesOnReturn?: string;
+  /** Condition of the item when returned, if any. */
+  returnedCondition?: string;
+  /** Courier who did the pickup. */
+  pickupCourierId?: string;
+  /** Courier who did the return. */
+  returnCourierId?: string;
+  /** Url of the returned condition photo */
+  returnedConditionPhotoUrl?: string;
 }
 
-export interface PermissionDoc {
-    description?: string | null;
-    category?: string | null;
+/** Interface representing an order item. */
+export interface OrderItem {
+  /** Product in order. */
+  productId: string;
+  /** Quantity of the product. */
+  quantity: number;
+  /** Unit price of the product (in smallest unit). */
+  unitPriceSmallestUnit: number;
+  /** Name of the product */
+  productName: string;
+  /** Customizations made to the order (optional). */
+  customization?: object;
 }
 
-export interface AppConfigGeneral {
-    defaultCurrencyCode?: string;
-    defaultPickupTimeBufferMinutes?: number; // V5
-    logRetentionDays?: number;
-    inactivityThresholdDays?: number;
-    supportedLanguages?: string[];
-    standardTags?: string[]; // V5
-}
-// Define interfaces for other appConfig documents as needed
-export interface AppConfigTipSettings {
-    tipEnabled?: boolean;
-    tipOptionsPercentage?: number[];
-    allowCustomTip?: boolean;
-}
-export interface AppConfigMatRentalSettings {
-    overtimeIntervalMinutes?: number;
-    overtimeFeeSmallestUnit?: number;
-    cleaningFeeSmallestUnit?: number;
-    allowedReturnRadiusKm?: number;
-    maxReturnResults?: number;
-}
-export interface AppConfigEventSettings {
-    minOrderValueSmallestUnit?: { [currency: string]: number }; // Map<String, Integer>
-    cancellationFeeSmallestUnit?: { [currency: string]: number }; // Map<String, Integer>
-    cancellationWindowHours?: number;
-    validLocationZones?: any[]; // Define Zone structure if used
-    defaultEventDurationMinutes?: number;
-    maxBookingLeadTimeDays?: number;
-    minBookingLeadTimeDays?: number;
-    requiresAdminApproval?: boolean;
-    googleCalendarIntegrationEnabled?: boolean;
-    targetCalendarIds?: { [resourceTypeOrKey: string]: string }; // Map<String, String>
-    timeZone?: string; // e.g., 'Asia/Jerusalem'
-}
-export interface AppConfigAlertRules {
-    velocityCheckPeriodMinutes?: number;
-    highSalesThreshold?: number;
-    staleInventoryPeriodDays?: number;
-    minStockForStaleCheck?: number;
-    lowSalesThresholdForStale?: number;
-}
-export interface AppConfigVipSettings {
-    lookbackDays?: number;
-    rules?: { tier: string; minSpending?: number; minOrders?: number }[];
-}
-export interface AppConfigRatingSettings {
-    ratingLookbackPeriodDays?: number;
-    minRatingsForAverage?: number;
+/** Enum representing possible order statuses. */
+export enum OrderStatus {
+  Pending = 'Pending',
+  Confirmed = 'Confirmed',
+  Preparing = 'Preparing',
+  ReadyForPickup = 'ReadyForPickup',
+  OutForDelivery = 'OutForDelivery',
+  Delivered = 'Delivered',
+  Cancelled = 'Cancelled',
+  Failed = 'Failed',
 }
 
+/** Interface representing an order. */
+export interface Order {
+  /** Unique identifier for the order. */
+  orderId: string;
+  /** Customer who made the order. */
+  customerId: string;
+  /** Box associated with the order (optional). */
+  boxId?: string;
+  /** Status of the order. */
+  orderStatus: OrderStatus;
+  /** Items in the order. */
+  items: OrderItem[];
+  /** Subtotal of the order (in smallest unit). */
+  subtotalSmallestUnit: number;
+  /** Tax applied to the order (in smallest unit). */
+  taxSmallestUnit: number;
+  /** Tip added to the order (optional, in smallest unit). */
+  tipSmallestUnit?: number;
+  /** Total amount of the order (in smallest unit). */
+  totalSmallestUnit: number;
+  /** Currency code used for the order. */
+  currencyCode: string;
+  /** Payment status for this order. */
+  paymentStatus: PaymentStatus;
+  /** Payment details for this order. */
+  paymentDetails?: PaymentDetails;
+  /** Delivery address for the order (optional). */
+  deliveryAddress?: string;
+  /** Delivery location for the order (optional). */
+  deliveryLocation?: admin.firestore.GeoPoint;
+  /** Scheduled pickup time for the order (optional). */
+  scheduledPickupTime?: admin.firestore.Timestamp;
+  /** Actual pickup time for the order (optional). */
+  actualPickupTime?: admin.firestore.Timestamp;
+  /** Timestamp indicating when the order was created. */
+  createdAt: admin.firestore.Timestamp;
+  /** Timestamp indicating when the order was last updated. */
+  updatedAt: admin.firestore.Timestamp;
+  /** Cancellation details if the order is cancelled (optional). */
+  cancellationDetails?: CancellationDetails;
+}
 
+/** Interface representing a product. */
+export interface Product {
+  /** Unique identifier for the product. */
+  productId: string;
+  /** Name of the product. */
+  name: string;
+  /** Description of the product (optional). */
+  description?: string;
+  /** Price of the product (in smallest unit). */
+  priceSmallestUnit: number;
+  /** Currency code used for the product. */
+  currencyCode: string;
+  /** Category of the product. */
+  category: string;
+  /** Image URL of the product (optional). */
+  imageUrl?: string;
+  /** Indicates if the product is active. */
+  isActive: boolean;
+  /** Boxes where the product is available (optional). */
+  availableAtBoxes?: string[];
+  /** Allergens in the product (optional). */
+  allergens?: string[];
+  /** Timestamp indicating when the product was created. */
+  createdAt: admin.firestore.Timestamp;
+  /** Timestamp indicating when the product was last updated. */
+  updatedAt: admin.firestore.Timestamp;
+}
+
+/** Interface representing a menu. */
+export interface Menu {
+  /** Unique identifier for the menu. */
+  menuId: string;
+  /** Name of the menu. */
+  name: string;
+  /** Description of the menu (optional). */
+  description?: string;
+  /** Products in the menu. */
+  productIds: string[];
+  /** Boxes where the menu is applicable (optional). */
+  applicableBoxIds?: string[];
+  /** Indicates if the menu is active. */
+  isActive: boolean;
+  /** Timestamp indicating when the menu was created. */
+  createdAt: admin.firestore.Timestamp;
+  /** Timestamp indicating when the menu was last updated. */
+  updatedAt: admin.firestore.Timestamp;
+}
+
+/** Enum representing possible event statuses. */
+export enum EventStatus {
+  PendingConfirmation = 'PendingConfirmation',
+  Confirmed = 'Confirmed',
+  Preparation = 'Preparation',
+  Active = 'Active',
+  Completed = 'Completed',
+  Cancelled = 'Cancelled',
+}
+
+/** Interface representing the event agreement details. */
+export interface EventAgreement {
+  signedByCustomer: boolean;
+  signedTimestamp?: admin.firestore.Timestamp;
+  agreementUrl?: string;
+}
+
+/** Interface representing an event booking. */
+export interface EventBooking {
+  /** Unique identifier for the event booking. */
+  eventBookingId: string;
+  /** Customer who made the event booking. */
+  customerId: string;
+  /** Type of the event. */
+  eventType: string;
+  /** Date of the event. */
+  eventDate: admin.firestore.Timestamp;
+  /** Duration of the event (in hours). */
+  durationHours: number;
+  /** Location of the event. */
+  location: string;
+  /** Number of guests for the event. */
+  numberOfGuests: number;
+  /** Menu selected for the event (optional). */
+  menuId?: string;
+  /** Special requests for the event (optional). */
+  specialRequests?: string;
+  /** Total price of the event (in smallest unit). */
+  totalPriceSmallestUnit: number;
+  /** Currency code used for the event. */
+  currencyCode: string;
+  /** Payment status for this event. */
+  paymentStatus: PaymentStatus;
+  /** Payment details for this event. */
+  paymentDetails?: PaymentDetails;
+  /** Status of the event. */
+  eventStatus: EventStatus;
+  /** Assigned staff members for the event (optional). */
+  assignedStaffIds?: string[];
+  /** Timestamp indicating when the event booking was created. */
+  createdAt: admin.firestore.Timestamp;
+  /** Timestamp indicating when the event booking was last updated. */
+  updatedAt: admin.firestore.Timestamp;
+  /** Cancellation details if the event booking is cancelled (optional). */
+  cancellationDetails?: CancellationDetails;
+  /** Event agreement data. */
+  agreement?: EventAgreement;
+}
+
+/** Enum representing discount types for promo codes. */
+export enum DiscountType {
+  Percentage = 'Percentage',
+  FixedAmount = 'FixedAmount',
+}
+
+/** Interface representing a promo code. */
 export interface PromoCode {
-    couponCode?: string | null;
-    description?: string | null;
-    isActive: boolean;
-    validFrom?: admin.firestore.Timestamp | null;
-    validUntil?: admin.firestore.Timestamp | null;
-    maxTotalUses?: number | null;
-    currentTotalUses?: number;
-    maxUsesPerUser?: number | null;
-    targetAudienceRules?: { [key: string]: any }; // Map
-    allowCombining?: boolean;
-    discountDetails: { type: "percentage" | "fixedAmount"; percentageValue?: number | null; fixedAmountSmallestUnit?: number | null };
-    minOrderValueSmallestUnit?: number | null; // Integer
-    createdAt?: admin.firestore.Timestamp;
-    updatedAt?: admin.firestore.Timestamp;
+  /** Unique code for the promo. */
+  code: string;
+  /** Description of the promo code. */
+  description: string;
+  /** Type of discount (Percentage or FixedAmount). */
+  discountType: DiscountType;
+  /** Value of the discount. */
+  discountValue: number;
+  /** Currency code for FixedAmount discounts (optional). */
+  currencyCode?: string;
+  /** Applicable product IDs (optional). */
+  applicableProductIds?: string[];
+  /** Applicable rental item IDs (optional). */
+  applicableRentalItemIds?: string[];
+  /** Minimum order value for the promo code (optional). */
+  minOrderValueSmallestUnit?: number;
+  /** Maximum number of uses for the promo code (optional). */
+  maxUses?: number;
+  /** Number of times the promo code has been used. */
+  usesCount: number;
+  /** Timestamp indicating when the promo code is valid from. */
+  validFrom: admin.firestore.Timestamp;
+  /** Timestamp indicating when the promo code is valid until. */
+  validUntil: admin.firestore.Timestamp;
+  /** Indicates if the promo code is active. */
+  isActive: boolean;
+  /** Timestamp indicating when the promo code was created. */
+  createdAt: admin.firestore.Timestamp;
 }
 
-export interface UserFeedback {
-    bookingId: string; // Ref: orders or eventBookings
-    bookingType: "Order" | "Event" | string;
-    customerId: string; // Ref: users
-    courierId?: string | null; // Ref: users
-    rating: number; // e.g., 1-5
-    comments?: string | null;
-    tags?: string[] | null;
-    timestamp: admin.firestore.Timestamp;
+/** Interface representing a shift. */
+export interface Shift {
+  /** Unique identifier for the shift. */
+  shiftId: string;
+  /** Courier assigned to the shift. */
+  courierId: string;
+  /** Timestamp indicating the start of the shift. */
+  startTimestamp: admin.firestore.Timestamp;
+  /** Timestamp indicating the end of the shift (optional). */
+  endTimestamp?: admin.firestore.Timestamp;
+  /** Box where the shift starts. */
+  startBoxId: string;
+  /** Box where the shift ends (optional). */
+  endBoxId?: string;
+  /** Total earnings for the shift (optional, in smallest unit). */
+  totalEarningsSmallestUnit?: number;
+  /** Currency code for the shift. */
+  currencyCode: string;
+  /** Notes for the shift (optional). */
+  notes?: string;
 }
 
-export interface ActivityLog {
-    timestamp: admin.firestore.Timestamp;
-    userId: string; // User performing action or system
-    userRole?: string | null;
-    action: string; // e.g., "CreateOrder", "UpdateBoxStatus"
-    details: { [key: string]: any }; // Map with context
-    ipAddress?: string | null;
-    userAgent?: string | null;
+/** Enum representing actions for inventory logs. */
+export enum InventoryLogAction {
+  StockIn = 'StockIn',
+  StockOut = 'StockOut',
+  Adjustment = 'Adjustment',
+  TransferIn = 'TransferIn',
+  TransferOut = 'TransferOut',
+  Sale = 'Sale',
+  RentalPickup = 'RentalPickup',
+  RentalReturn = 'RentalReturn',
 }
 
-export interface DailyReport {
-    reportDate: string; // YYYY-MM-DD
-    generationTimestamp: admin.firestore.Timestamp;
-    totalRevenueSmallestUnit: number; // Integer
-    totalOrders: number;
-    totalTipsSmallestUnit?: number; // Integer
-    revenueByCurrency?: { [currency: string]: number }; // Map<String, Integer>
-    ordersByCurrency?: { [currency: string]: number }; // Map<String, Integer>
-    paymentMethodCounts?: { [method: string]: number }; // Map<String, Integer>
-    revenueByBox?: { [boxId: string]: number }; // Map<String, Integer>
-    ordersByBox?: { [boxId: string]: number }; // Map<String, Integer>
-    averageOrderValueSmallestUnit?: number; // Integer
-    // Add more aggregated fields as needed
+/** Interface representing an inventory log. */
+export interface InventoryLog {
+  /** Unique identifier for the inventory log. */
+  logId: string;
+  /** Timestamp indicating when the log was created. */
+  timestamp: admin.firestore.Timestamp;
+  /** User who performed the action. */
+  userId: string;
+  /** Action performed. */
+  action: InventoryLogAction;
+  /** Product related to the action (optional). */
+  productId?: string;
+  /** Rental item related to the action (optional). */
+  rentalItemId?: string;
+  /** Box where the action occurred. */
+  boxId: string;
+  /** Change in quantity. */
+  quantityChange: number;
+  /** Reason for the action (optional). */
+  reason?: string;
+  /** Related Order ID, if any. */
+  relatedOrderId?: string;
+  /** Related Rental Booking ID, if any. */
+  relatedBookingId?: string;
+}
+
+/** Enum representing notification types. */
+export enum NotificationType {
+  Info = 'Info',
+  Warning = 'Warning',
+  Error = 'Error',
+  OrderUpdate = 'OrderUpdate',
+  RentalUpdate = 'RentalUpdate',
+  EventUpdate = 'EventUpdate',
+}
+
+/** Interface representing a notification. */
+export interface Notification {
+  /** Unique identifier for the notification. */
+  notificationId: string;
+  /** User who should receive the notification. */
+  userId: string;
+  /** Title of the notification. */
+  title: string;
+  /** Message of the notification. */
+  message: string;
+  /** Type of the notification. */
+  type: NotificationType;
+  /** Indicates if the notification has been read. */
+  read: boolean;
+  /** Timestamp indicating when the notification was created. */
+  createdAt: admin.firestore.Timestamp;
+  /** ID of a related entity, if any. */
+  relatedEntityId?: string;
+  /** Type of a related entity, if any. */
+  relatedEntityType?: string;
+}
+
+/** Interface representing an audit log. */
+export interface AuditLog {
+  /** Unique identifier for the audit log. */
+  logId: string;
+  /** Timestamp indicating when the action occurred. */
+  timestamp: admin.firestore.Timestamp;
+  /** User who performed the action. */
+  userId: string;
+    /** User's email (optional)*/
+  userEmail?: string;
+  /** Action performed. */
+  action: string;
+  /** Type of entity related to the action. */
+  entityType: string;
+  /** ID of the entity related to the action. */
+  entityId: string;
+  /** Changes made to the entity. */
+  changes: object;
+  /** IP address of the user who performed the action (optional). */
+  ipAddress?: string;
+}
+
+/** Interface representing multi-factor authentication configuration. */
+export interface MfaConfig {
+    /** Unique identifier of the user. */
+    userId: string;
+    /** Encrypted MFA secret. */
+    secret: string;
+    /** Encrypted backup codes. */
+    backupCodes: string[];
+    /** Indicates whether MFA is confirmed */
+    confirmed: boolean;
+}
+
+/** Enum representing OTP types. */
+export enum OtpType {
+    Login = 'Login',
+    PasswordReset = 'PasswordReset',
+    MfaSetup = 'MfaSetup',
+}
+
+/** Interface representing a One Time Password */
+export interface Otp {
+    otpId: string;
+    userId: string;
+    code: string;
+    expiresAt: admin.firestore.Timestamp;
+    used: boolean;
+    type: OtpType;
+}
+
+/** Interface representing a VIP Tier. */
+export interface VipTier {
+    /** Unique identifier of the vip tier */
+    tierId: string;
+    /** Name of the vip tier */
+    name: string;
+    /** Minimum spend to get this vip tier in smallest unit */
+    minSpendSmallestUnit: number;
+    /** Currency code for the vip tier */
+    currencyCode: string;
+    /** Description of the benefits of the tier */
+    benefitsDescription: string;
 }
