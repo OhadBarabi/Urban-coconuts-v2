@@ -564,7 +564,7 @@ export interface AuditLog {
   timestamp: admin.firestore.Timestamp;
   /** User who performed the action. */
   userId: string;
-    /** User's email (optional)*/
+  /** User's email (optional)*/
   userEmail?: string;
   /** Action performed. */
   action: string;

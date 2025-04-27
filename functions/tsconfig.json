@@ -1,5 +1,4 @@
 {
-  "compileOnSave": true,
   "compilerOptions": {
     "module": "commonjs",
     "noImplicitReturns": true,
@@ -14,6 +13,7 @@
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true
   },
+  "compileOnSave": true,
   "include": [
     "src"
   ]
